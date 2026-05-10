@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sazo.symphony.linear-fetch</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>$HOME/bin/symphony-linear-fetch</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/dongyeopkim/Library/Logs/symphony-linear-fetch.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/dongyeopkim/Library/Logs/symphony-linear-fetch.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/Users/dongyeopkim/.local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/dongyeopkim</string>
+  </dict>
+</dict>
+</plist>
