@@ -6,11 +6,13 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Claude.CmuxPrintBackend
   alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Linear.Mutate
+  alias SymphonyElixir.State.{AuthRealms, Issues}
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   # PR3 wire-up: chain-scoped backend dispatch. todo-code uses CmuxPrintBackend
   # (claude --print inside cmux pane → Issues.* state.db writes); other chains
-  # remain on Codex.AppServer (legacy path, no state.db writes yet).
+  # use Codex.AppServer transport with PR7a Issues/AuthRealms/LinearMutate wrapper.
   @cmux_print_chains ~w(todo-code)
 
   @type worker_host :: String.t() | nil
@@ -181,42 +183,115 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    chain = current_chain_name() || "codex"
+    issue_key = codex_issue_key(issue)
 
-    with {:ok, turn_session} <-
-           AppServer.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
-           ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+    case codex_begin_turn(issue_key, chain) do
+      {:ok, %{turn_id: turn_id, attempt_id: attempt_id}} ->
+        case AppServer.run_turn(
+               app_session,
+               prompt,
+               issue,
+               on_message: codex_message_handler(codex_update_recipient, issue)
+             ) do
+          {:ok, turn_session} ->
+            Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+            if not is_nil(issue_key) do
+              summary = %{
+                session_id: turn_session.session_id,
+                tool_calls: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                stop_reason: "completed",
+                success: true
+              }
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+              :ok = Issues.complete_turn(issue_key, %{
+                attempt_id: attempt_id,
+                turn_id: turn_id,
+                chain: chain,
+                session_id: turn_session.session_id,
+                summary: summary
+              })
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+              :ok = Mutate.post_turn_comment(issue_key, chain, summary)
+            end
 
-          :ok
+            case continue_with_issue?(issue, issue_state_fetcher) do
+              {:continue, refreshed_issue} when turn_number < max_turns ->
+                Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-        {:done, _refreshed_issue} ->
-          :ok
+                do_run_codex_turns(
+                  app_session,
+                  workspace,
+                  refreshed_issue,
+                  codex_update_recipient,
+                  opts,
+                  issue_state_fetcher,
+                  turn_number + 1,
+                  max_turns
+                )
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+              {:continue, refreshed_issue} ->
+                Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+                :ok
+
+              {:done, _refreshed_issue} ->
+                :ok
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            if not is_nil(issue_key) do
+              {:ok, _} = Issues.fail_turn(issue_key, %{
+                attempt_id: attempt_id,
+                turn_id: turn_id,
+                chain: chain,
+                reason: reason
+              })
+            end
+
+            {:error, reason}
+        end
+
+      {:error, :auth_blocked} ->
+        Logger.warning("codex turn skipped for #{issue_context(issue)}: auth realm blocked chain=#{chain}")
+        raise RuntimeError, "auth realm blocked for #{issue_context(issue)}"
+
+      {:error, :rate_limited} ->
+        Logger.warning("codex turn skipped for #{issue_context(issue)}: auth realm rate-limited chain=#{chain}")
+        raise RuntimeError, "auth realm rate-limited for #{issue_context(issue)}"
+
+      {:error, reason} ->
+        Logger.error("[codex] begin_turn failed: #{inspect(reason)} chain=#{chain}")
+        {:error, {:begin_turn_failed, reason}}
+    end
+  end
+
+  defp codex_issue_key(%Issue{identifier: id}) when is_binary(id) and id != "", do: id
+  defp codex_issue_key(%Issue{id: id}) when is_binary(id) and id != "", do: id
+  defp codex_issue_key(_), do: nil
+
+  defp codex_begin_turn(nil, _chain) do
+    turn_id = "dryrun-#{System.system_time(:millisecond)}-#{:rand.uniform(9999)}"
+    {:ok, %{turn_id: turn_id, attempt_id: 1, fence_seq: 0}}
+  end
+
+  defp codex_begin_turn(issue_key, chain) do
+    case AuthRealms.check(AuthRealms.default_realm()) do
+      :ok ->
+        Issues.begin_turn(issue_key, chain, agent: "codex")
+
+      {:blocked, blocked_until} ->
+        Logger.info("[codex] begin_turn skipped: realm blocked until #{blocked_until} chain=#{chain}")
+        {:error, :auth_blocked}
+
+      {:throttled, throttled_until} ->
+        Logger.info("[codex] begin_turn skipped: realm throttled until #{throttled_until} chain=#{chain}")
+        {:error, :rate_limited}
     end
   end
 
