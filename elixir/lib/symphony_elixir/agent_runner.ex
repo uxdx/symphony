@@ -9,10 +9,10 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   # PR7b chain routing:
-  #   todo-code            → CmuxPrintBackend (claude --print)
-  #   all other chains     → CmuxExecBackend  (codex exec --json)
+  #   todo-code, changes-requested-code  → CmuxPrintBackend (claude --print)
+  #   code-review-codex, in-review-qa    → CmuxExecBackend  (codex exec)
   # AppServer is retained for fallback/testing but not reached by any active chain.
-  @cmux_print_chains ~w(todo-code)
+  @cmux_print_chains ~w(todo-code changes-requested-code)
 
   @type worker_host :: String.t() | nil
 
