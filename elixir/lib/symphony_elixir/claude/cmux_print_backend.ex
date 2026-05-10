@@ -27,14 +27,11 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
 
   require Logger
 
-  @default_max_turns 50
-  @default_turn_timeout_ms 3_600_000
-
   @impl true
   def start_session(workspace, opts) do
     chain = Keyword.fetch!(opts, :chain_name)
 
-    case Cmux.ensure_lane(chain, workspace, agent: "claude") do
+    case Cmux.ensure_lane(chain, workspace, agent: "shell") do
       {:ok, lane} ->
         session = %{
           chain: chain,
@@ -108,6 +105,12 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   # Build a single-line bash exec body. Per STEP-3 §3 codex-round-5 finding:
   # do NOT export nonce / SYMPHONY_* vars (the wrapper owns those). Keep the
   # body minimal — wrapper handles sentinel + pgid + wait-for.
+  #
+  # claude CLI flag verification (PR2, claude 2.x):
+  #   - `--input-file` does not exist → use stdin redirect
+  #   - `--max-turns` does not exist → claude --print is single-shot,
+  #     multi-turn loops live above (PR3 do_run_codex_turns analogue)
+  #   - `--turn-timeout` does not exist → controlled by sazo-slave --timeout
   @doc false
   def build_claude_print_cmd(session, prompt, opts) do
     prompt_path =
@@ -126,8 +129,10 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         sid when is_binary(sid) -> ["--resume", shell_quote(sid)]
       end
 
-    max_turns = Keyword.get(opts, :max_turns, @default_max_turns)
-    turn_timeout_ms = Keyword.get(opts, :turn_timeout_ms, @default_turn_timeout_ms)
+    extra_args =
+      opts
+      |> Keyword.get(:claude_extra_args, [])
+      |> Enum.map(&shell_quote/1)
 
     args =
       [
@@ -136,17 +141,13 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         "--output-format",
         "stream-json",
         "--include-partial-messages",
-        "--max-turns",
-        to_string(max_turns),
-        "--turn-timeout",
-        to_string(turn_timeout_ms),
+        "--verbose",
         "--dangerously-skip-permissions"
-      ] ++
-        resume_arg ++ ["--input-file", shell_quote(prompt_path)]
+      ] ++ resume_arg ++ extra_args
 
     body = """
     #!/usr/bin/env bash
-    exec #{Enum.join(args, " ")}
+    exec #{Enum.join(args, " ")} < #{shell_quote(prompt_path)}
     """
 
     {body, prompt_path}
