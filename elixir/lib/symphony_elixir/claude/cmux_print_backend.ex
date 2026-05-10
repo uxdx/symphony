@@ -177,20 +177,30 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   def classify_error(_), do: :unknown
 
   defp classify_stdout(out) do
+    # Scan only the last 50 lines to avoid false positives from prompt content
+    # or bash terminal echoes that may contain user issue text.
+    tail =
+      out
+      |> String.split("\n")
+      |> Enum.take(-50)
+      |> Enum.join("\n")
+
     cond do
-      String.contains?(out, "Not logged in") or
-          String.contains?(out, "auth_required") or
-          String.contains?(out, "401") or
-          String.contains?(out, "credentials") ->
+      String.contains?(tail, "Not logged in") or
+          String.contains?(tail, "auth_required") or
+          String.contains?(tail, "TokenRefreshFailed") or
+          String.contains?(tail, "invalid_grant") or
+          String.contains?(tail, "HTTP 401") ->
         :auth_revoked
 
-      String.contains?(out, "rate limit") or
-          String.contains?(out, "429") or
-          String.contains?(out, "quota") ->
+      String.contains?(tail, "Rate limit exceeded") or
+          String.contains?(tail, "Too Many Requests") or
+          String.contains?(tail, "rate_limit_exceeded") or
+          String.contains?(tail, "HTTP 429") ->
         :rate_limit
 
-      String.contains?(out, "timeout") or
-          String.contains?(out, "deadline") ->
+      String.contains?(tail, "timeout") or
+          String.contains?(tail, "deadline") ->
         :turn_timeout
 
       true ->
