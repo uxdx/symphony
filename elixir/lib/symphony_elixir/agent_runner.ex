@@ -4,8 +4,14 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
+  alias SymphonyElixir.Claude.CmuxPrintBackend
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+
+  # PR3 wire-up: chain-scoped backend dispatch. todo-code uses CmuxPrintBackend
+  # (claude --print inside cmux pane → Issues.* state.db writes); other chains
+  # remain on Codex.AppServer (legacy path, no state.db writes yet).
+  @cmux_print_chains ~w(todo-code)
 
   @type worker_host :: String.t() | nil
 
@@ -77,6 +83,23 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+    chain = current_chain_name()
+
+    if chain in @cmux_print_chains do
+      run_cmux_print_turns(workspace, issue, codex_update_recipient, opts, chain)
+    else
+      run_codex_app_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+    end
+  end
+
+  defp current_chain_name do
+    case System.get_env("SYMPHONY_CHAIN_NAME") do
+      name when is_binary(name) and name != "" -> name
+      _ -> nil
+    end
+  end
+
+  defp run_codex_app_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
@@ -86,6 +109,65 @@ defmodule SymphonyElixir.AgentRunner do
       after
         AppServer.stop_session(session)
       end
+    end
+  end
+
+  defp run_cmux_print_turns(workspace, issue, codex_update_recipient, opts, chain) do
+    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
+    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+
+    Logger.info("Routing #{issue_context(issue)} to CmuxPrintBackend (chain=#{chain})")
+
+    with {:ok, session} <- CmuxPrintBackend.start_session(workspace, chain_name: chain) do
+      try do
+        do_run_cmux_print_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+      after
+        CmuxPrintBackend.stop_session(session)
+      end
+    end
+  end
+
+  defp do_run_cmux_print_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+
+    case CmuxPrintBackend.run_turn(session, prompt, issue,
+           on_message: codex_message_handler(codex_update_recipient, issue)
+         ) do
+      {:ok, summary, new_session} ->
+        Logger.info(
+          "Completed cmux_print turn for #{issue_context(issue)} session_id=#{summary[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
+        )
+
+        case continue_with_issue?(issue, issue_state_fetcher) do
+          {:continue, refreshed_issue} when turn_number < max_turns ->
+            do_run_cmux_print_turns(
+              new_session,
+              workspace,
+              refreshed_issue,
+              codex_update_recipient,
+              opts,
+              issue_state_fetcher,
+              turn_number + 1,
+              max_turns
+            )
+
+          {:continue, refreshed_issue} ->
+            Logger.info(
+              "Reached agent.max_turns for #{issue_context(refreshed_issue)} (cmux_print) — returning control to orchestrator"
+            )
+
+            :ok
+
+          {:done, _refreshed_issue} ->
+            :ok
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, reason} ->
+        Logger.warning("cmux_print run_turn failed for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
