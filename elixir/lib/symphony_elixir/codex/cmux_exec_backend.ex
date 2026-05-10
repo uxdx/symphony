@@ -100,14 +100,12 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         sid when is_binary(sid) and sid != "" ->
           [
             "codex", "exec", "resume", shell_quote(sid),
-            "--json",
             "--dangerously-bypass-approvals-and-sandbox"
           ]
 
         _ ->
           [
             "codex", "exec",
-            "--json",
             "-C", shell_quote(session.workspace),
             "--dangerously-bypass-approvals-and-sandbox"
           ]
@@ -165,7 +163,8 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         events = ExecJsonParser.parse(raw_stdout)
         Enum.each(events, fn ev -> on_message.(%{event: :codex_exec_event, data: ev}) end)
 
-        summary = ExecJsonParser.summarize(events)
+        # exit 0 → success regardless of JSON events (supports both --json and plain-text mode)
+        summary = events |> ExecJsonParser.summarize() |> Map.put(:success, true)
         new_sid = summary[:session_id] || session.session_id
 
         if state_required? and not is_nil(issue_key) do
