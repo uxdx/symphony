@@ -92,7 +92,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         "symphony-codex-#{:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)}.md"
       )
 
-    File.write!(prompt_path, prompt)
+    File.write!(prompt_path, sanitize_utf8(prompt))
     File.chmod!(prompt_path, 0o600)
 
     args =
@@ -205,25 +205,38 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   defp classify_error(_), do: :unknown
 
   defp classify_stdout(out) do
+    # Scan only the last 50 lines to avoid false positives from prompt content
+    # or bash terminal echoes that may contain user issue text.
+    tail =
+      out
+      |> String.split("\n")
+      |> Enum.take(-50)
+      |> Enum.join("\n")
+
     cond do
-      String.contains?(out, "TokenRefreshFailed") or
-          String.contains?(out, "invalid_grant") or
-          String.contains?(out, "auth_required") or
-          String.contains?(out, "Not logged in") ->
+      String.contains?(tail, "TokenRefreshFailed") or
+          String.contains?(tail, "invalid_grant") or
+          String.contains?(tail, "auth_required") or
+          String.contains?(tail, "Not logged in") ->
         :auth_revoked
 
-      String.contains?(out, "rate limit") or
-          String.contains?(out, "429") or
-          String.contains?(out, "quota") ->
+      String.contains?(tail, "Rate limit exceeded") or
+          String.contains?(tail, "Too Many Requests") or
+          String.contains?(tail, "rate_limit_exceeded") or
+          String.contains?(tail, "HTTP 429") ->
         :rate_limit
 
-      String.contains?(out, "timeout") or
-          String.contains?(out, "deadline") ->
+      String.contains?(tail, "timeout") or
+          String.contains?(tail, "deadline") ->
         :turn_timeout
 
       true ->
         :unknown
     end
+  end
+
+  defp sanitize_utf8(str) when is_binary(str) do
+    for <<c::utf8 <- str>>, into: "", do: <<c::utf8>>
   end
 
   defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :auth_revoked) do
