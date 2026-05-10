@@ -23,6 +23,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
 
   alias SymphonyElixir.Cmux
   alias SymphonyElixir.Agent.StreamJsonParser
+  alias SymphonyElixir.Linear.Mutate
   alias SymphonyElixir.State.Issues
   alias SymphonyElixir.State.AuthRealms
 
@@ -303,6 +304,8 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
               session_id: new_sid,
               summary: summary
             })
+
+          :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
         end
 
         new_session = %{session | session_id: new_sid}
