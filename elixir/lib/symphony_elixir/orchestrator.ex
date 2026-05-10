@@ -611,6 +611,8 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
+  @lockout_label "agt1-needs-human"
+
   defp candidate_issue?(
          %Issue{
            id: id,
@@ -624,10 +626,15 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     issue_routable_to_worker?(issue) and
       active_issue_state?(state_name, active_states) and
-      !terminal_issue_state?(state_name, terminal_states)
+      !terminal_issue_state?(state_name, terminal_states) and
+      !lockout_label?(issue)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp lockout_label?(%Issue{} = issue) do
+    @lockout_label in Issue.label_names(issue)
+  end
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
