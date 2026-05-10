@@ -114,7 +114,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
     body = """
     #!/usr/bin/env bash
     [ -f ~/.sazo/secrets.env ] && source ~/.sazo/secrets.env
-    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
     exec #{Enum.join(args, " ")} < #{shell_quote(prompt_path)}
     """
 
