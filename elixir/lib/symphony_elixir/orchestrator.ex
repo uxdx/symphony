@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.State.AuthRealms
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -225,10 +226,17 @@ defmodule SymphonyElixir.Orchestrator do
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
+         :ok <- check_auth_realm(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
     else
+      {:error, :auth_realm_blocked} ->
+        state
+
+      {:error, :auth_realm_throttled} ->
+        state
+
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
         state
@@ -269,6 +277,21 @@ defmodule SymphonyElixir.Orchestrator do
 
       false ->
         state
+    end
+  end
+
+  defp check_auth_realm do
+    case AuthRealms.check(AuthRealms.default_realm()) do
+      :ok ->
+        :ok
+
+      {:blocked, blocked_until} ->
+        Logger.info("[orchestrator] dispatch skipped: realm blocked until #{blocked_until}")
+        {:error, :auth_realm_blocked}
+
+      {:throttled, throttled_until} ->
+        Logger.info("[orchestrator] dispatch skipped: realm throttled until #{throttled_until}")
+        {:error, :auth_realm_throttled}
     end
   end
 
