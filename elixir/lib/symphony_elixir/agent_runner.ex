@@ -11,7 +11,7 @@ defmodule SymphonyElixir.AgentRunner do
   # PR3 wire-up: chain-scoped backend dispatch. todo-code uses CmuxPrintBackend
   # (claude --print inside cmux pane → Issues.* state.db writes); other chains
   # remain on Codex.AppServer (legacy path, no state.db writes yet).
-  @cmux_print_chains ~w()
+  @cmux_print_chains ~w(todo-code)
 
   @type worker_host :: String.t() | nil
 
