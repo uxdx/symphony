@@ -102,7 +102,23 @@ defmodule SymphonyElixir.State.Migrations do
     "CREATE INDEX IF NOT EXISTS idx_events_fence ON events(boot_run_id, fence_seq)"
   ]
 
-  @migrations %{1 => @v1_statements}
+  @v2_statements [
+    """
+    CREATE TABLE IF NOT EXISTS auth_realms (
+      realm_id        TEXT PRIMARY KEY,
+      status          TEXT NOT NULL DEFAULT 'healthy',
+      epoch           INTEGER NOT NULL DEFAULT 0,
+      blocked_until   INTEGER,
+      block_count     INTEGER NOT NULL DEFAULT 0,
+      throttled_until INTEGER,
+      throttle_count  INTEGER NOT NULL DEFAULT 0,
+      updated_at      INTEGER NOT NULL,
+      CHECK (status IN ('healthy', 'blocked'))
+    )
+    """
+  ]
+
+  @migrations %{1 => @v1_statements, 2 => @v2_statements}
 
   @doc "Apply all pending migrations idempotently."
   @spec migrate(reference()) :: :ok

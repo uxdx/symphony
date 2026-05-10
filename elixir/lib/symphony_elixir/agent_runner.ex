@@ -165,6 +165,14 @@ defmodule SymphonyElixir.AgentRunner do
             {:error, reason}
         end
 
+      {:error, :auth_blocked} ->
+        Logger.warning("cmux_print turn skipped for #{issue_context(issue)}: auth realm blocked")
+        raise RuntimeError, "auth realm blocked for #{issue_context(issue)}"
+
+      {:error, :rate_limited} ->
+        Logger.warning("cmux_print turn skipped for #{issue_context(issue)}: auth realm rate-limited")
+        raise RuntimeError, "auth realm rate-limited for #{issue_context(issue)}"
+
       {:error, reason} ->
         Logger.warning("cmux_print run_turn failed for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}

@@ -774,6 +774,14 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
+    max_attempts = Config.settings!().agent.max_retry_attempts
+
+    if max_attempts > 0 and next_attempt > max_attempts do
+      identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
+      Logger.warning("Retry cap reached for issue_id=#{issue_id} issue_identifier=#{identifier} after #{next_attempt} attempts; releasing claim")
+      release_issue_claim(state, issue_id)
+    else
+
     delay_ms = retry_delay(next_attempt, metadata)
     old_timer = Map.get(previous_retry, :timer_ref)
     retry_token = make_ref()
@@ -807,6 +815,7 @@ defmodule SymphonyElixir.Orchestrator do
             workspace_path: workspace_path
           })
     }
+    end
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -840,7 +849,7 @@ defmodule SymphonyElixir.Orchestrator do
          schedule_issue_retry(
            state,
            issue_id,
-           attempt + 1,
+           attempt,
            Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
          )}
     end
@@ -912,7 +921,7 @@ defmodule SymphonyElixir.Orchestrator do
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
+         attempt,
          Map.merge(metadata, %{
            identifier: issue.identifier,
            error: "no available orchestrator slots"

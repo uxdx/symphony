@@ -24,6 +24,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   alias SymphonyElixir.Cmux
   alias SymphonyElixir.Agent.StreamJsonParser
   alias SymphonyElixir.State.Issues
+  alias SymphonyElixir.State.AuthRealms
 
   require Logger
 
@@ -69,6 +70,12 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         after
           _ = File.rm(prompt_path)
         end
+
+      {:error, :auth_blocked} = err ->
+        err
+
+      {:error, :rate_limited} = err ->
+        err
 
       {:error, reason} ->
         Logger.error("[claude_cmux] begin_turn failed: #{inspect(reason)} chain=#{chain}")
@@ -190,6 +197,45 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     end
   end
 
+  # For auth_revoked and rate_limit, record the realm-level event and still call
+  # fail_turn so the issue exits turn_running. Retry budget is consumed, but the
+  # admission gate (begin/3) prevents new turns while the realm is blocked —
+  # meaning budget is only burned once per realm-unblock cycle.
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :auth_revoked) do
+    :ok = AuthRealms.block(AuthRealms.default_realm())
+
+    {:ok, _} =
+      Issues.fail_turn(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        reason: :auth_revoked
+      })
+  end
+
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :rate_limit) do
+    retry_at = System.system_time(:second) + 3600
+    :ok = AuthRealms.throttle(AuthRealms.default_realm(), retry_at)
+
+    {:ok, _} =
+      Issues.fail_turn(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        reason: :rate_limit
+      })
+  end
+
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason) do
+    {:ok, _} =
+      Issues.fail_turn(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        reason: reason
+      })
+  end
+
   defp shell_quote(s) when is_binary(s) do
     "'" <> String.replace(s, "'", "'\\''") <> "'"
   end
@@ -212,7 +258,18 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   defp begin(true, nil, _chain), do: {:error, :missing_issue_id}
 
   defp begin(true, issue_key, chain) do
-    Issues.begin_turn(issue_key, chain, agent: "claude")
+    case AuthRealms.check(AuthRealms.default_realm()) do
+      :ok ->
+        Issues.begin_turn(issue_key, chain, agent: "claude")
+
+      {:blocked, blocked_until} ->
+        Logger.info("[claude_cmux] begin_turn skipped: realm blocked until #{blocked_until} chain=#{chain}")
+        {:error, :auth_blocked}
+
+      {:throttled, throttled_until} ->
+        Logger.info("[claude_cmux] begin_turn skipped: realm throttled until #{throttled_until} chain=#{chain}")
+        {:error, :rate_limited}
+    end
   end
 
   defp do_run_turn(session, issue_key, turn_id, attempt_id, _fence_seq, cmd_body, ctx) do
@@ -259,13 +316,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         )
 
         if state_required? and not is_nil(issue_key) do
-          {:ok, _} =
-            Issues.fail_turn(issue_key, %{
-              attempt_id: attempt_id,
-              turn_id: turn_id,
-              chain: chain,
-              reason: classified
-            })
+          handle_turn_failure(issue_key, turn_id, attempt_id, chain, classified)
         end
 
         {:error, classified}
