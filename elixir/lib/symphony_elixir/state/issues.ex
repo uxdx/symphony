@@ -504,6 +504,13 @@ defmodule SymphonyElixir.State.Issues do
       Map.get(ev, :issue_id), Map.get(ev, :turn_id), Map.get(ev, :chain),
       ev.kind, payload
     ])
+
+    State.append_event_wal(%{
+      ts: ev.ts, boot_run_id: ev.boot_run_id, fence_seq: ev.fence_seq,
+      issue_id: Map.get(ev, :issue_id), turn_id: Map.get(ev, :turn_id),
+      chain: Map.get(ev, :chain), kind: ev.kind,
+      payload: Map.get(ev, :payload, %{})
+    })
   end
 
   defp normalize_tx_result({:ok, :ok}), do: :ok

@@ -6,12 +6,16 @@ defmodule SymphonyElixir.State do
   start_link option, primarily for tests). Single-writer GenServer guards the
   connection — concurrent writers are not part of PR3.
 
-  PR3 contract:
+  PR6 adds a JSONL WAL at `<db_dir>/events.jsonl` — every event written to
+  the `events` table is also appended as a JSON line. External tools can
+  `tail -f` this file for real-time event streaming.
+
+  PR3/PR6 contract:
     * boot_runs INSERT on start_link
     * fence_counter monotonic via `allocate_fence/0`
     * issues / turn_attempts / events tables (see `SymphonyElixir.State.Migrations`)
     * 15-state CHECK constraint (see schema)
-    * record_event/1 inserts to `events` only — JSONL WAL is PR6 scope.
+    * record_event/1 and Issues.insert_event_in_tx/2 both write SQLite + WAL
   """
 
   use GenServer
@@ -45,6 +49,33 @@ defmodule SymphonyElixir.State do
       nil -> Path.join([System.user_home!(), ".sazo", @default_db_subpath])
       path -> path
     end
+  end
+
+  @doc """
+  JSONL WAL path — same directory as the DB, filename `events.jsonl`.
+  Inherits the same test override as `default_db_path/0`.
+  """
+  @spec default_wal_path() :: Path.t()
+  def default_wal_path do
+    Path.join(Path.dirname(default_db_path()), "events.jsonl")
+  end
+
+  @doc """
+  Append one event as a JSON line to the JSONL WAL. Best-effort:
+  file errors are logged but never propagate to the caller.
+  """
+  @spec append_event_wal(map()) :: :ok
+  def append_event_wal(ev) do
+    path = default_wal_path()
+
+    try do
+      line = Jason.encode!(ev) <> "\n"
+      File.write(path, line, [:append])
+    rescue
+      e -> Logger.warning("[state_wal] failed to append event: #{inspect(e)}")
+    end
+
+    :ok
   end
 
   @doc """
@@ -196,6 +227,13 @@ defmodule SymphonyElixir.State do
 
     :done = Sqlite3.step(conn, stmt)
     :ok = Sqlite3.release(conn, stmt)
+
+    append_event_wal(%{
+      ts: ts, boot_run_id: boot_run_id, fence_seq: fence_seq,
+      issue_id: issue_id, turn_id: turn_id, chain: chain,
+      kind: kind, payload: Map.get(ev, :payload, %{})
+    })
+
     :ok
   end
 end
