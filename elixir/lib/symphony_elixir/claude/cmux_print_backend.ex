@@ -1,29 +1,29 @@
 defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   @moduledoc """
-  PR2 read-only backend. Wires `claude --print --output-format stream-json`
-  through `SymphonyElixir.Cmux` (sazo-slave run-turn) so credentials read
-  from the macOS keychain succeed (login-keychain unlocked inside the cmux
-  pane shell).
+  PR3 backend. Wires `claude --print --output-format stream-json` through
+  `SymphonyElixir.Cmux` (sazo-slave run-turn) so credentials read from the
+  macOS keychain succeed (login-keychain unlocked inside the cmux pane shell).
 
-  PR2 contract — `dry_run_only: true` is enforced:
+  PR3 contract:
 
-    * **No** Linear mutations from `cmd_body` (the prompt may instruct the
-      agent to analyse only — Linear writes are gated by `sazo-linear-mutate`
-      arriving in PR3 and are not invoked from this module).
-    * **No** state-machine claim/fence (Issues.upsert/begin_turn/fail_turn
-      live in Step 6 / PR3+ and are not called).
-    * **No** retry/throttle/realm-pause logic. classify_error/rate_limit
-      handling lands in PR3 once `Issues` + `RateLimiter` exist.
-
-  The only behaviour kept from STEP-3 §3 is the happy path (parse + summarize)
-  plus error tagging passed back to the caller verbatim. G-PR2 verifies the
-  Linear-mutate-counter == 0 guarantee from outside this module.
+    * `begin_turn` / `complete_turn` / `fail_turn` go through
+      `SymphonyElixir.State.Issues` (CAS state machine, fence_seq, per-issue
+      flock). Caller must supply an issue with a non-nil identifier.
+    * `classify_error/1` maps run_turn errors → 4 reason atoms
+      (`:auth_revoked`, `:rate_limit`, `:turn_timeout`, `:sentinel_missing`,
+      `:nonce_mismatch`, `:unknown`). `auth_revoked` uses a shorter retry
+      schedule (3-step) inside `RetryBudget`. PR4 promotes it to realm pause.
+    * No Linear writes from this module yet (PR5 introduces
+      `sazo-linear-mutate`). G-PR3 still verifies Linear-mutate-counter == 0.
+    * `:state_required` opt (default `true`) — set to `false` for harness runs
+      that only want the dry-run / parse path (G-PR2 fixture, no SQLite).
   """
 
   @behaviour SymphonyElixir.Agent.Backend
 
   alias SymphonyElixir.Cmux
   alias SymphonyElixir.Agent.StreamJsonParser
+  alias SymphonyElixir.State.Issues
 
   require Logger
 
@@ -50,37 +50,29 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   @impl true
   def run_turn(%{chain: chain, workspace: workspace} = session, prompt, issue, opts)
       when is_binary(prompt) do
-    turn_id = Keyword.get(opts, :turn_id) || generate_turn_id(issue)
-    attempt_id = Keyword.get(opts, :attempt_id, 1)
+    state_required? = Keyword.get(opts, :state_required, true)
     timeout = Keyword.get(opts, :turn_timeout, 3600)
+    issue_key = issue_key(issue)
 
-    {cmd_body, prompt_path} = build_claude_print_cmd(session, prompt, opts)
+    case begin(state_required?, issue_key, chain) do
+      {:ok, %{turn_id: turn_id, attempt_id: attempt_id, fence_seq: fence_seq}} ->
+        {cmd_body, prompt_path} = build_claude_print_cmd(session, prompt, opts)
 
-    try do
-      case Cmux.run_turn(chain,
-             workspace: workspace,
-             turn_id: turn_id,
-             attempt_id: attempt_id,
-             cmd_body: cmd_body,
-             timeout: timeout
-           ) do
-        {:ok, raw_stdout} ->
-          on_message = Keyword.get(opts, :on_message, fn _ -> :ok end)
-          events = StreamJsonParser.parse(raw_stdout)
-          Enum.each(events, on_message)
+        try do
+          do_run_turn(session, issue_key, turn_id, attempt_id, fence_seq, cmd_body,
+            chain: chain,
+            workspace: workspace,
+            timeout: timeout,
+            opts: opts,
+            state_required?: state_required?
+          )
+        after
+          _ = File.rm(prompt_path)
+        end
 
-          summary = StreamJsonParser.summarize(events)
-          new_sid = summary[:session_id] || session.session_id
-          new_session = %{session | session_id: new_sid}
-
-          {:ok, Map.put(summary, :session_id, new_sid), new_session}
-
-        {:error, reason} ->
-          Logger.warning("[claude_cmux] run_turn error: #{inspect(reason)} chain=#{chain}")
-          {:error, reason}
-      end
-    after
-      _ = File.rm(prompt_path)
+      {:error, reason} ->
+        Logger.error("[claude_cmux] begin_turn failed: #{inspect(reason)} chain=#{chain}")
+        {:error, {:begin_turn_failed, reason}}
     end
   end
 
@@ -153,7 +145,130 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     {body, prompt_path}
   end
 
+  @doc """
+  Map a run_turn error tuple to a stable reason atom for `RetryBudget`.
+
+  Authoritative classification per STEP-3 §7:
+
+    * `:turn_timeout` — sazo-slave exit 124 (wall-clock cap hit)
+    * `:sentinel_missing` — exit 125 (wrapper sentinel not seen)
+    * `:nonce_mismatch` — exit 126 (forgery suspect, lane quarantine)
+    * `:auth_revoked` — stdout contains "Not logged in" / "401" / "auth_required"
+                        / "credentials"
+    * `:rate_limit` — stdout contains "rate limit" / "429" / "quota"
+    * `:unknown` — anything else
+  """
+  @spec classify_error(term()) :: :turn_timeout | :sentinel_missing | :nonce_mismatch
+                                     | :auth_revoked | :rate_limit | :unknown
+  def classify_error(:turn_timeout), do: :turn_timeout
+  def classify_error(:sentinel_missing), do: :sentinel_missing
+  def classify_error({:nonce_mismatch, _out}), do: :nonce_mismatch
+  def classify_error({:turn_failed, _code, out}) when is_binary(out), do: classify_stdout(out)
+  def classify_error({:lane_spawn_failed, _}), do: :unknown
+  def classify_error({:begin_turn_failed, _}), do: :unknown
+  def classify_error(_), do: :unknown
+
+  defp classify_stdout(out) do
+    cond do
+      String.contains?(out, "Not logged in") or
+          String.contains?(out, "auth_required") or
+          String.contains?(out, "401") or
+          String.contains?(out, "credentials") ->
+        :auth_revoked
+
+      String.contains?(out, "rate limit") or
+          String.contains?(out, "429") or
+          String.contains?(out, "quota") ->
+        :rate_limit
+
+      String.contains?(out, "timeout") or
+          String.contains?(out, "deadline") ->
+        :turn_timeout
+
+      true ->
+        :unknown
+    end
+  end
+
   defp shell_quote(s) when is_binary(s) do
     "'" <> String.replace(s, "'", "'\\''") <> "'"
+  end
+
+  ## Internals
+
+  defp issue_key(%{identifier: id}) when is_binary(id) and id != "", do: id
+  defp issue_key(%{id: id}) when is_binary(id) and id != "", do: id
+  defp issue_key(%{"identifier" => id}) when is_binary(id) and id != "", do: id
+  defp issue_key(%{"id" => id}) when is_binary(id) and id != "", do: id
+  defp issue_key(_), do: nil
+
+  defp begin(false, _issue_key, _chain) do
+    # state_required? = false → caller (e.g. G-PR2 dry-run harness) opts out of
+    # SQLite. Fabricate a turn_id so the rest of the pipeline runs unchanged.
+    turn_id = "dryrun-#{System.system_time(:millisecond)}-#{:rand.uniform(9999)}"
+    {:ok, %{turn_id: turn_id, attempt_id: 1, fence_seq: 0}}
+  end
+
+  defp begin(true, nil, _chain), do: {:error, :missing_issue_id}
+
+  defp begin(true, issue_key, chain) do
+    Issues.begin_turn(issue_key, chain, agent: "claude")
+  end
+
+  defp do_run_turn(session, issue_key, turn_id, attempt_id, _fence_seq, cmd_body, ctx) do
+    chain = Keyword.fetch!(ctx, :chain)
+    workspace = Keyword.fetch!(ctx, :workspace)
+    timeout = Keyword.fetch!(ctx, :timeout)
+    opts = Keyword.fetch!(ctx, :opts)
+    state_required? = Keyword.fetch!(ctx, :state_required?)
+
+    case Cmux.run_turn(chain,
+           workspace: workspace,
+           turn_id: turn_id,
+           attempt_id: attempt_id,
+           cmd_body: cmd_body,
+           timeout: timeout
+         ) do
+      {:ok, raw_stdout} ->
+        on_message = Keyword.get(opts, :on_message, fn _ -> :ok end)
+        events = StreamJsonParser.parse(raw_stdout)
+        Enum.each(events, on_message)
+
+        summary = StreamJsonParser.summarize(events)
+        new_sid = summary[:session_id] || session.session_id
+
+        if state_required? and not is_nil(issue_key) do
+          :ok =
+            Issues.complete_turn(issue_key, %{
+              attempt_id: attempt_id,
+              turn_id: turn_id,
+              chain: chain,
+              session_id: new_sid,
+              summary: summary
+            })
+        end
+
+        new_session = %{session | session_id: new_sid}
+        {:ok, Map.put(summary, :session_id, new_sid), new_session}
+
+      {:error, reason} ->
+        classified = classify_error(reason)
+
+        Logger.warning(
+          "[claude_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}"
+        )
+
+        if state_required? and not is_nil(issue_key) do
+          {:ok, _} =
+            Issues.fail_turn(issue_key, %{
+              attempt_id: attempt_id,
+              turn_id: turn_id,
+              chain: chain,
+              reason: classified
+            })
+        end
+
+        {:error, classified}
+    end
   end
 end
