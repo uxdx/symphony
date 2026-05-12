@@ -35,6 +35,16 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_issue_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    comments =
+      Application.get_env(:symphony_elixir, :memory_tracker_comments, %{})
+      |> Map.get(issue_id, [])
+      |> Enum.filter(&is_map/1)
+
+    {:ok, comments}
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
     send_event({:memory_tracker_comment, issue_id, body})

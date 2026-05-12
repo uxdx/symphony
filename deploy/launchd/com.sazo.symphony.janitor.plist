@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.sazo.symphony.janitor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>$HOME/bin/symphony-janitor.sh</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/dongyeopkim</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/dongyeopkim/Library/Logs/symphony-janitor.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/dongyeopkim/Library/Logs/symphony-janitor.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/Users/dongyeopkim/.local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/dongyeopkim</string>
+    <!--
+      JANITOR_DRY_RUN 키 미설정 → 실제 mutation 활성화 (D4, 2026-05-09).
+      수동 검증·디버깅 시에만 ad-hoc 으로:
+        JANITOR_DRY_RUN=1 bash $HOME/bin/symphony-janitor.sh
+    -->
+  </dict>
+</dict>
+</plist>

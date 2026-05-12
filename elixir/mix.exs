@@ -19,12 +19,39 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Orchestrator,
           SymphonyElixir.Orchestrator.State,
           SymphonyElixir.AgentRunner,
+          SymphonyElixir.AuthHealthWorker,
           SymphonyElixir.CLI,
           SymphonyElixir.Codex.AppServer,
+          SymphonyElixir.Codex.CmuxExecBackend,
           SymphonyElixir.Codex.DynamicTool,
+          SymphonyElixir.Codex.ExecJsonParser,
+          SymphonyElixir.Cmux,
+          SymphonyElixir.Claude.CmuxPrintBackend,
+          SymphonyElixir.Config.Compiler,
+          SymphonyElixir.Config.Schema,
+          SymphonyElixir.Config.Schema.Claude,
           SymphonyElixir.HttpServer,
+          SymphonyElixir.Linear.Adapter,
+          SymphonyElixir.Linear.Mutate,
+          SymphonyElixir.RetryBudget,
+          SymphonyElixir.State,
+          SymphonyElixir.State.AuthRealms,
+          SymphonyElixir.State.Issues,
+          SymphonyElixir.State.Issues.StaleStateError,
+          SymphonyElixir.State.Migrations,
           SymphonyElixir.StatusDashboard,
+          SymphonyElixir.Tracker,
+          SymphonyElixir.Tracker.Memory,
+          SymphonyElixir.Verification,
+          SymphonyElixir.Verification.Generic,
+          SymphonyElixir.Verification.Noop,
+          SymphonyElixir.Verification.TodoCode,
           SymphonyElixir.LogFile,
+          Mix.Tasks.Launchd.Check,
+          Mix.Tasks.Ops.Check,
+          Mix.Tasks.Release.Check,
+          Mix.Tasks.Symphony.Workflow.Preflight,
+          Mix.Tasks.Workflow.Check,
           SymphonyElixir.Workspace,
           SymphonyElixirWeb.DashboardLive,
           SymphonyElixirWeb.Endpoint,
@@ -47,9 +74,33 @@ defmodule SymphonyElixir.MixProject do
         plt_add_apps: [:mix]
       ],
       escript: escript(),
+      releases: releases(),
       aliases: aliases(),
       deps: deps()
     ]
+  end
+
+  defp releases do
+    [
+      symphony: [
+        applications: [symphony_elixir: :permanent],
+        include_executables_for: [:unix],
+        steps: [:assemble, &write_release_commit/1]
+      ]
+    ]
+  end
+
+  defp write_release_commit(%Mix.Release{} = release) do
+    commit = System.get_env("SYMPHONY_RELEASE_COMMIT") || git_head() || "unknown"
+    File.write!(Path.join(release.path, "RELEASE_COMMIT"), commit <> "\n")
+    release
+  end
+
+  defp git_head do
+    case System.cmd("git", ["rev-parse", "HEAD"], stderr_to_stdout: true) do
+      {commit, 0} -> String.trim(commit)
+      _ -> nil
+    end
   end
 
   # Run "mix help compile.app" to learn about applications.
@@ -74,6 +125,7 @@ defmodule SymphonyElixir.MixProject do
       {:yaml_elixir, "~> 2.12"},
       {:solid, "~> 1.2"},
       {:ecto, "~> 3.13"},
+      {:exqlite, "~> 0.27"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]

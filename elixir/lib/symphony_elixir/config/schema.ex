@@ -42,6 +42,8 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    alias SymphonyElixir.Config.Schema
+
     @primary_key false
 
     embedded_schema do
@@ -49,6 +51,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:team_key, :string)
+      field(:required_labels, {:array, :string}, default: [])
+      field(:exclude_labels, {:array, :string}, default: [])
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
@@ -59,9 +64,25 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :team_key,
+          :required_labels,
+          :exclude_labels,
+          :assignee,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
+      |> Schema.validate_label_list(:required_labels)
+      |> Schema.validate_label_list(:exclude_labels)
+      |> update_change(:required_labels, &Schema.normalize_label_names/1)
+      |> update_change(:exclude_labels, &Schema.normalize_label_names/1)
+      |> Schema.validate_disjoint_label_filters(:required_labels, :exclude_labels)
     end
   end
 
@@ -128,9 +149,11 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      field(:backend, :string, default: "codex")
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
+      field(:max_retry_attempts, :integer, default: 0)
       field(:max_concurrent_agents_by_state, :map, default: %{})
     end
 
@@ -139,12 +162,20 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :backend,
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_retry_attempts,
+          :max_concurrent_agents_by_state
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> validate_number(:max_retry_attempts, greater_than_or_equal_to: 0)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
     end
@@ -158,6 +189,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:exec_command, :string, default: "codex exec")
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -183,6 +215,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :exec_command,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
@@ -192,7 +225,7 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
-      |> validate_required([:command])
+      |> validate_required([:command, :exec_command])
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
@@ -218,6 +251,26 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(attrs, [:after_create, :before_run, :after_run, :before_remove, :timeout_ms], empty_values: [])
       |> validate_number(:timeout_ms, greater_than: 0)
+    end
+  end
+
+  defmodule Claude do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string)
+      field(:permission_mode, :string)
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:command, :permission_mode, :turn_timeout_ms], empty_values: [])
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
     end
   end
 
@@ -258,6 +311,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(attrs, [:port, :host], empty_values: [])
       |> validate_number(:port, greater_than_or_equal_to: 0)
+      |> validate_number(:port, less_than_or_equal_to: 65_535)
     end
   end
 
@@ -268,6 +322,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:claude, Claude, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -323,6 +378,25 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @doc false
+  @spec normalize_label_name(String.t()) :: String.t()
+  def normalize_label_name(label_name) when is_binary(label_name) do
+    label_name
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  @doc false
+  @spec normalize_label_names([String.t()] | nil) :: [String.t()]
+  def normalize_label_names(nil), do: []
+
+  def normalize_label_names(label_names) when is_list(label_names) do
+    label_names
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&normalize_label_name/1)
+    |> Enum.uniq()
+  end
+
+  @doc false
   @spec normalize_state_limits(nil | map()) :: map()
   def normalize_state_limits(nil), do: %{}
 
@@ -351,6 +425,45 @@ defmodule SymphonyElixir.Config.Schema do
     end)
   end
 
+  @doc false
+  @spec validate_label_list(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_label_list(changeset, field) do
+    validate_change(changeset, field, fn ^field, labels ->
+      Enum.flat_map(labels, fn label ->
+        cond do
+          not is_binary(label) ->
+            [{field, "labels must be strings"}]
+
+          String.trim(label) == "" ->
+            [{field, "labels must not be blank"}]
+
+          true ->
+            []
+        end
+      end)
+    end)
+  end
+
+  @doc false
+  @spec validate_disjoint_label_filters(Ecto.Changeset.t(), atom(), atom()) :: Ecto.Changeset.t()
+  def validate_disjoint_label_filters(changeset, required_field, exclude_field) do
+    required_labels = MapSet.new(get_field(changeset, required_field) || [])
+    exclude_labels = MapSet.new(get_field(changeset, exclude_field) || [])
+
+    overlap =
+      required_labels
+      |> MapSet.intersection(exclude_labels)
+      |> MapSet.to_list()
+
+    case overlap do
+      [] ->
+        changeset
+
+      labels ->
+        add_error(changeset, exclude_field, "must not overlap required_labels: #{Enum.join(labels, ", ")}")
+    end
+  end
+
   defp changeset(attrs) do
     %__MODULE__{}
     |> cast(attrs, [])
@@ -360,6 +473,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:claude, with: &Claude.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)

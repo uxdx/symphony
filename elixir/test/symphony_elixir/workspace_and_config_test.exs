@@ -371,6 +371,72 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.assigned_to_worker
   end
 
+  test "linear client applies workflow label filters to worker routing" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: ["AGT1-Ready-For-Symphony"],
+      tracker_exclude_labels: ["AGT1-Needs-Human"]
+    )
+
+    raw_issue = %{
+      "id" => "issue-labels",
+      "identifier" => "MT-LABELS",
+      "title" => "Label routed task",
+      "state" => %{"name" => "Todo"},
+      "assignee" => %{"id" => "user-1"},
+      "labels" => %{"nodes" => [%{"name" => "agt1-ready-for-symphony"}]}
+    }
+
+    routed_issue = Client.normalize_issue_for_test(raw_issue, "user-1")
+    assert routed_issue.assigned_to_worker
+
+    missing_required =
+      put_in(raw_issue, ["labels", "nodes"], [
+        %{"name" => "different-label"}
+      ])
+
+    refute Client.normalize_issue_for_test(missing_required, "user-1").assigned_to_worker
+
+    excluded =
+      put_in(raw_issue, ["labels", "nodes"], [
+        %{"name" => "agt1-ready-for-symphony"},
+        %{"name" => "AGT1-NEEDS-HUMAN"}
+      ])
+
+    refute Client.normalize_issue_for_test(excluded, "user-1").assigned_to_worker
+  end
+
+  test "linear client can poll by team key when project slug is absent" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: "AGT1"
+    )
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:linear_poll_query, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, []} = Client.fetch_issues_by_states_for_test(["Todo"], graphql_fun)
+
+    assert_receive {
+      :linear_poll_query,
+      query,
+      %{teamKey: "AGT1", stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil}
+    }
+
+    assert query =~ "SymphonyLinearPollByTeam"
+    assert query =~ "team: {key: {eq: $teamKey}}"
+  end
+
   test "linear client pagination merge helper preserves issue ordering" do
     issue_page_1 = [
       %Issue{id: "issue-1", identifier: "MT-1"},
@@ -741,10 +807,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
+    assert config.tracker.team_key == nil
+    assert config.tracker.required_labels == []
+    assert config.tracker.exclude_labels == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
+    assert config.codex.exec_command == "codex exec"
 
     assert config.codex.approval_policy == %{
              "reject" => %{
@@ -773,11 +843,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.stall_timeout_ms == 300_000
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
+      codex_command: "codex --config 'model=\"gpt-5.5\"' app-server",
+      codex_exec_command: "codex --config 'model=\"gpt-5.5\"' exec"
     )
 
     assert Config.settings!().codex.command ==
              "codex --config 'model=\"gpt-5.5\"' app-server"
+
+    assert Config.settings!().codex.exec_command ==
+             "codex --config 'model=\"gpt-5.5\"' exec"
 
     explicit_root =
       Path.join(
@@ -885,6 +959,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "codex app-server")
     assert Config.settings!().codex.command == "codex app-server"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_exec_command: "codex exec")
+    assert Config.settings!().codex.exec_command == "codex exec"
   end
 
   test "config resolves $VAR references for env-backed secret and path values" do
@@ -908,13 +985,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
       workspace_root: "$#{workspace_env_var}",
-      codex_command: "#{codex_bin} app-server"
+      codex_command: "#{codex_bin} app-server",
+      codex_exec_command: "#{codex_bin} exec"
     )
 
     config = Config.settings!()
     assert config.tracker.api_key == api_key
     assert config.workspace.root == Path.expand(workspace_root)
     assert config.codex.command == "#{codex_bin} app-server"
+    assert config.codex.exec_command == "#{codex_bin} exec"
   end
 
   test "config no longer resolves legacy env: references" do

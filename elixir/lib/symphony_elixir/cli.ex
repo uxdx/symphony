@@ -3,6 +3,7 @@ defmodule SymphonyElixir.CLI do
   Escript entrypoint for running Symphony with an explicit WORKFLOW.md path.
   """
 
+  alias SymphonyElixir.Config.Compiler
   alias SymphonyElixir.LogFile
 
   @acknowledgement_switch :i_understand_that_this_will_be_running_without_the_usual_guardrails
@@ -14,6 +15,7 @@ defmodule SymphonyElixir.CLI do
           set_workflow_file_path: (String.t() -> :ok | {:error, term()}),
           set_logs_root: (String.t() -> :ok | {:error, term()}),
           set_server_port_override: (non_neg_integer() | nil -> :ok | {:error, term()}),
+          preflight_workflow_file: (String.t() -> :ok | {:error, String.t()}),
           ensure_all_started: (-> ensure_started_result())
         }
 
@@ -55,18 +57,31 @@ defmodule SymphonyElixir.CLI do
   def run(workflow_path, deps) do
     expanded_path = Path.expand(workflow_path)
 
-    if deps.file_regular?.(expanded_path) do
-      :ok = deps.set_workflow_file_path.(expanded_path)
-
-      case deps.ensure_all_started.() do
-        {:ok, _started_apps} ->
-          :ok
-
-        {:error, reason} ->
-          {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
-      end
+    with :ok <- require_workflow_file(expanded_path, deps),
+         :ok <- preflight_workflow(expanded_path, deps),
+         :ok <- deps.set_workflow_file_path.(expanded_path),
+         {:ok, _started_apps} <- deps.ensure_all_started.() do
+      :ok
     else
-      {:error, "Workflow file not found: #{expanded_path}"}
+      {:error, {:missing_workflow_file, path}} ->
+        {:error, "Workflow file not found: #{path}"}
+
+      {:error, {:workflow_preflight_failed, message}} ->
+        {:error, "Workflow preflight failed: #{message}"}
+
+      {:error, reason} ->
+        {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
+    end
+  end
+
+  defp require_workflow_file(expanded_path, deps) do
+    if deps.file_regular?.(expanded_path), do: :ok, else: {:error, {:missing_workflow_file, expanded_path}}
+  end
+
+  defp preflight_workflow(expanded_path, deps) do
+    case deps.preflight_workflow_file.(expanded_path) do
+      :ok -> :ok
+      {:error, message} -> {:error, {:workflow_preflight_failed, message}}
     end
   end
 
@@ -82,6 +97,7 @@ defmodule SymphonyElixir.CLI do
       set_workflow_file_path: &SymphonyElixir.Workflow.set_workflow_file_path/1,
       set_logs_root: &set_logs_root/1,
       set_server_port_override: &set_server_port_override/1,
+      preflight_workflow_file: &Compiler.preflight_file/1,
       ensure_all_started: fn -> Application.ensure_all_started(:symphony_elixir) end
     }
   end

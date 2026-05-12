@@ -317,7 +317,8 @@ defmodule SymphonyElixir.StatusDashboard do
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
-             polling: Map.get(snapshot, :polling)
+             polling: Map.get(snapshot, :polling),
+             db: Map.get(snapshot, :db)
            }},
           update_token_samples(token_samples, now_ms, total_tokens)
         }
@@ -334,6 +335,7 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
+        db = Map.get(snapshot, :db) || %{}
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -345,6 +347,7 @@ defmodule SymphonyElixir.StatusDashboard do
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
+        db_rows = format_db_reconcile_rows(db)
         backoff_rows = format_retry_rows(retrying)
 
         ([
@@ -363,6 +366,7 @@ defmodule SymphonyElixir.StatusDashboard do
              colorize(" | ", @ansi_gray) <>
              colorize("total #{format_count(codex_total_tokens)}", @ansi_yellow),
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
+           colorize("│ State DB: ", @ansi_bold) <> format_db_reconcile_summary(db),
            project_link_lines,
            project_refresh_line,
            colorize("├─ Running", @ansi_bold),
@@ -372,6 +376,9 @@ defmodule SymphonyElixir.StatusDashboard do
          ] ++
            running_rows ++
            running_to_backoff_spacer ++
+           [colorize("├─ State DB reconciliation", @ansi_bold), "│"] ++
+           db_rows ++
+           ["│"] ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -393,16 +400,10 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_project_link_lines do
-    project_part =
-      case Config.settings!().tracker.project_slug do
-        project_slug when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
+    tracker = Config.settings!().tracker
+    {scope_label, project_part} = tracker_scope_display(tracker)
 
-        _ ->
-          colorize("n/a", @ansi_gray)
-      end
-
-    project_line = colorize("│ Project: ", @ansi_bold) <> project_part
+    project_line = colorize("│ #{scope_label}: ", @ansi_bold) <> project_part
 
     case dashboard_url() do
       url when is_binary(url) ->
@@ -428,6 +429,22 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
+
+  defp tracker_scope_display(tracker) do
+    cond do
+      present_string?(tracker.project_slug) ->
+        {"Project", colorize(linear_project_url(String.trim(tracker.project_slug)), @ansi_cyan)}
+
+      present_string?(tracker.team_key) ->
+        {"Team", colorize(String.trim(tracker.team_key), @ansi_cyan)}
+
+      true ->
+        {"Tracker", colorize("n/a", @ansi_gray)}
+    end
+  end
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
 
   defp dashboard_url do
     dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())
@@ -562,7 +579,8 @@ defmodule SymphonyElixir.StatusDashboard do
              retrying: retrying,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
-             polling: Map.get(snapshot, :polling)
+             polling: Map.get(snapshot, :polling),
+             db: Map.get(snapshot, :db)
            }}
 
         _ ->
@@ -655,6 +673,97 @@ defmodule SymphonyElixir.StatusDashboard do
       |> String.split(", ")
     end
   end
+
+  defp format_db_reconcile_summary(db) when is_map(db) do
+    stale_count = db |> db_turn_running_not_runtime() |> length()
+    orphan_count = db |> db_orphaned_turn_attempts() |> length()
+
+    cond do
+      is_binary(Map.get(db, :error)) ->
+        colorize("error=#{Map.get(db, :error)}", @ansi_red)
+
+      stale_count == 0 and orphan_count == 0 ->
+        colorize("clean", @ansi_green)
+
+      true ->
+        colorize("stale_turn_running=#{stale_count}", @ansi_red) <>
+          colorize(" | ", @ansi_gray) <>
+          colorize("orphaned_attempts=#{orphan_count}", @ansi_yellow)
+    end
+  end
+
+  defp format_db_reconcile_summary(_db), do: colorize("unknown", @ansi_gray)
+
+  defp format_db_reconcile_rows(db) when is_map(db) do
+    stale_rows =
+      db
+      |> db_turn_running_not_runtime()
+      |> Enum.sort_by(&Map.get(&1, :issue_id, ""))
+      |> Enum.map(&format_db_stale_turn_running_row/1)
+
+    orphan_rows =
+      db
+      |> db_orphaned_turn_attempts()
+      |> Enum.sort_by(&{Map.get(&1, :issue_id, ""), Map.get(&1, :attempt_id, 0)})
+      |> Enum.map(&format_db_orphaned_attempt_row/1)
+
+    cond do
+      is_binary(Map.get(db, :error)) ->
+        ["│  " <> colorize("janitor error: #{Map.get(db, :error)}", @ansi_red)]
+
+      stale_rows == [] and orphan_rows == [] ->
+        ["│  " <> colorize("No stale DB running rows or orphaned turn attempts", @ansi_gray)]
+
+      true ->
+        stale_rows ++ orphan_rows
+    end
+  end
+
+  defp format_db_reconcile_rows(_db), do: ["│  " <> colorize("State DB findings unavailable", @ansi_gray)]
+
+  defp format_db_stale_turn_running_row(row) do
+    issue_id = Map.get(row, :issue_id) || "unknown"
+    attempt = Map.get(row, :attempt_id) || 0
+    owner_boot = Map.get(row, :owner_boot_run_id) || "n/a"
+    owner_pid = Map.get(row, :owner_pid) || "n/a"
+    owner_status = Map.get(row, :owner_status) || "unknown"
+
+    "│  " <>
+      colorize("!", @ansi_red) <>
+      " " <>
+      colorize("#{issue_id}", @ansi_red) <>
+      " " <>
+      colorize("db=turn_running", @ansi_red) <>
+      colorize(" runtime=absent", @ansi_yellow) <>
+      colorize(" attempt=#{attempt}", @ansi_gray) <>
+      colorize(" owner_boot=#{owner_boot}", @ansi_gray) <>
+      colorize(" owner_pid=#{owner_pid}", @ansi_gray) <>
+      colorize(" owner_status=#{owner_status}", @ansi_gray)
+  end
+
+  defp format_db_orphaned_attempt_row(row) do
+    issue_id = Map.get(row, :issue_id) || "unknown"
+    attempt = Map.get(row, :attempt_id) || 0
+    state = Map.get(row, :state) || "unknown"
+    issue_state = Map.get(row, :issue_state) || "missing"
+    reason = Map.get(row, :orphan_reason) || "unknown"
+
+    "│  " <>
+      colorize("?", @ansi_yellow) <>
+      " " <>
+      colorize("#{issue_id}", @ansi_yellow) <>
+      " " <>
+      colorize("turn_attempt=#{state}", @ansi_yellow) <>
+      colorize(" issue_state=#{issue_state}", @ansi_gray) <>
+      colorize(" attempt=#{attempt}", @ansi_gray) <>
+      colorize(" reason=#{reason}", @ansi_gray)
+  end
+
+  defp db_turn_running_not_runtime(db) when is_map(db),
+    do: Map.get(db, :turn_running_not_runtime) || []
+
+  defp db_orphaned_turn_attempts(db) when is_map(db),
+    do: Map.get(db, :orphaned_turn_attempts) || []
 
   defp format_retry_summary(retry_entry) do
     issue_id = retry_entry.issue_id || "unknown"

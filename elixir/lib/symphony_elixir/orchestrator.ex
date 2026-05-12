@@ -9,6 +9,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.State.AuthRealms
+  alias SymphonyElixir.State.Issues, as: StateIssues
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -225,15 +227,22 @@ defmodule SymphonyElixir.Orchestrator do
     state = reconcile_running_issues(state)
 
     with :ok <- Config.validate!(),
+         :ok <- check_auth_realm(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
     else
+      {:error, :auth_realm_blocked} ->
+        state
+
+      {:error, :auth_realm_throttled} ->
+        state
+
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
         state
 
-      {:error, :missing_linear_project_slug} ->
+      {:error, :missing_linear_project_slug_or_team_key} ->
         Logger.error("Linear project slug missing in WORKFLOW.md")
         state
 
@@ -269,6 +278,21 @@ defmodule SymphonyElixir.Orchestrator do
 
       false ->
         state
+    end
+  end
+
+  defp check_auth_realm do
+    case AuthRealms.check(AuthRealms.default_realm()) do
+      :ok ->
+        :ok
+
+      {:blocked, blocked_until} ->
+        Logger.info("[orchestrator] dispatch skipped: realm blocked until #{blocked_until}")
+        {:error, :auth_realm_blocked}
+
+      {:throttled, throttled_until} ->
+        Logger.info("[orchestrator] dispatch skipped: realm throttled until #{throttled_until}")
+        {:error, :auth_realm_throttled}
     end
   end
 
@@ -588,6 +612,8 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
+  @lockout_label "agt1-needs-human"
+
   defp candidate_issue?(
          %Issue{
            id: id,
@@ -601,10 +627,36 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     issue_routable_to_worker?(issue) and
       active_issue_state?(state_name, active_states) and
-      !terminal_issue_state?(state_name, terminal_states)
+      !terminal_issue_state?(state_name, terminal_states) and
+      tracker_label_filters_pass?(issue) and
+      !lockout_label?(issue)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp lockout_label?(%Issue{} = issue) do
+    @lockout_label in Issue.label_names(issue)
+  end
+
+  defp tracker_label_filters_pass?(%Issue{} = issue) do
+    tracker = Config.settings!().tracker
+    labels = issue |> Issue.label_names() |> MapSet.new()
+
+    required_labels_present?(labels, tracker.required_labels) and
+      excluded_labels_absent?(labels, tracker.exclude_labels)
+  end
+
+  defp required_labels_present?(_labels, []), do: true
+
+  defp required_labels_present?(labels, required_labels) do
+    Enum.all?(required_labels, &MapSet.member?(labels, &1))
+  end
+
+  defp excluded_labels_absent?(_labels, []), do: true
+
+  defp excluded_labels_absent?(labels, exclude_labels) do
+    Enum.all?(exclude_labels, &(not MapSet.member?(labels, &1)))
+  end
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
@@ -774,39 +826,47 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
-    delay_ms = retry_delay(next_attempt, metadata)
-    old_timer = Map.get(previous_retry, :timer_ref)
-    retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
-    identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
-    error = pick_retry_error(previous_retry, metadata)
-    worker_host = pick_retry_worker_host(previous_retry, metadata)
-    workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    max_attempts = Config.settings!().agent.max_retry_attempts
 
-    if is_reference(old_timer) do
-      Process.cancel_timer(old_timer)
+    if max_attempts > 0 and next_attempt > max_attempts do
+      identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
+      Logger.warning("Retry cap reached for issue_id=#{issue_id} issue_identifier=#{identifier} after #{next_attempt} attempts; releasing claim")
+      release_issue_claim(state, issue_id)
+    else
+      delay_ms = retry_delay(next_attempt, metadata)
+      old_timer = Map.get(previous_retry, :timer_ref)
+      retry_token = make_ref()
+      due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+      identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
+      error = pick_retry_error(previous_retry, metadata)
+      worker_host = pick_retry_worker_host(previous_retry, metadata)
+      workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+
+      if is_reference(old_timer) do
+        Process.cancel_timer(old_timer)
+      end
+
+      timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
+
+      error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+
+      Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
+
+      %{
+        state
+        | retry_attempts:
+            Map.put(state.retry_attempts, issue_id, %{
+              attempt: next_attempt,
+              timer_ref: timer_ref,
+              retry_token: retry_token,
+              due_at_ms: due_at_ms,
+              identifier: identifier,
+              error: error,
+              worker_host: worker_host,
+              workspace_path: workspace_path
+            })
+      }
     end
-
-    timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
-
-    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
-
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
-
-    %{
-      state
-      | retry_attempts:
-          Map.put(state.retry_attempts, issue_id, %{
-            attempt: next_attempt,
-            timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            identifier: identifier,
-            error: error,
-            worker_host: worker_host,
-            workspace_path: workspace_path
-          })
-    }
   end
 
   defp pop_retry_attempt_state(%State{} = state, issue_id, retry_token) when is_reference(retry_token) do
@@ -840,7 +900,7 @@ defmodule SymphonyElixir.Orchestrator do
          schedule_issue_retry(
            state,
            issue_id,
-           attempt + 1,
+           attempt,
            Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
          )}
     end
@@ -912,7 +972,7 @@ defmodule SymphonyElixir.Orchestrator do
        schedule_issue_retry(
          state,
          issue.id,
-         attempt + 1,
+         attempt,
          Map.merge(metadata, %{
            identifier: issue.identifier,
            error: "no available orchestrator slots"
@@ -1140,10 +1200,13 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    db_findings = janitor_findings_for_snapshot(running)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
+       db: db_findings,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1167,6 +1230,20 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  defp janitor_findings_for_snapshot(running) when is_list(running) do
+    running_issue_ids =
+      Enum.flat_map(running, fn
+        %{issue_id: issue_id} when is_binary(issue_id) -> [issue_id]
+        _ -> []
+      end)
+
+    StateIssues.janitor_findings(running_issue_ids)
+  rescue
+    error ->
+      Logger.warning("Failed collecting state-db janitor findings: #{Exception.message(error)}")
+      %{turn_running_not_runtime: [], orphaned_turn_attempts: [], error: Exception.message(error)}
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do

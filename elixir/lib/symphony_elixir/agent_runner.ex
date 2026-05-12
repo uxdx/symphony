@@ -4,8 +4,12 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
+  alias SymphonyElixir.Codex.CmuxExecBackend
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+
+  # PR7b chain routing:
+  #   all active CS Tool chains -> CmuxExecBackend (codex exec)
+  # AppServer is retained for fallback/testing but not reached by any active chain.
 
   @type worker_host :: String.t() | nil
 
@@ -77,56 +81,100 @@ defmodule SymphonyElixir.AgentRunner do
   defp send_worker_runtime_info(_recipient, _issue, _worker_host, _workspace), do: :ok
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
+    chain = current_chain_name()
+    run_codex_exec_turns(workspace, issue, codex_update_recipient, opts, chain || worker_host)
+  end
+
+  defp current_chain_name do
+    case System.get_env("SYMPHONY_CHAIN_NAME") do
+      name when is_binary(name) and name != "" -> name
+      _ -> nil
+    end
+  end
+
+  defp run_codex_exec_turns(workspace, issue, codex_update_recipient, opts, chain) do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    chain_name = chain || "codex-exec"
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    Logger.info("Routing #{issue_context(issue)} to CmuxExecBackend (chain=#{chain_name})")
+
+    with {:ok, session} <- CmuxExecBackend.start_session(workspace, chain_name: chain_name) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_exec_turns(
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          1,
+          max_turns
+        )
       after
-        AppServer.stop_session(session)
+        CmuxExecBackend.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_exec_turns(
+         session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
-    with {:ok, turn_session} <-
-           AppServer.run_turn(
-             app_session,
-             prompt,
-             issue,
-             on_message: codex_message_handler(codex_update_recipient, issue)
-           ) do
-      Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
+    turn_opts =
+      opts
+      |> Keyword.take([:issue_comment_fetcher, :git_runner, :expected_branch])
+      |> Keyword.put(:issue_state_fetcher, issue_state_fetcher)
+      |> Keyword.put(:on_message, codex_message_handler(codex_update_recipient, issue))
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+    case CmuxExecBackend.run_turn(session, prompt, issue, turn_opts) do
+      {:ok, summary, new_session} ->
+        Logger.info("Completed codex_exec turn for #{issue_context(issue)} session_id=#{summary[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+        case continue_with_issue?(issue, issue_state_fetcher) do
+          {:continue, refreshed_issue} when turn_number < max_turns ->
+            do_run_codex_exec_turns(
+              new_session,
+              workspace,
+              refreshed_issue,
+              codex_update_recipient,
+              opts,
+              issue_state_fetcher,
+              turn_number + 1,
+              max_turns
+            )
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+          {:continue, refreshed_issue} ->
+            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} (codex_exec) — returning control to orchestrator")
 
-          :ok
+            :ok
 
-        {:done, _refreshed_issue} ->
-          :ok
+          {:done, _refreshed_issue} ->
+            :ok
 
-        {:error, reason} ->
-          {:error, reason}
-      end
+          {:error, reason} ->
+            {:error, reason}
+        end
+
+      {:error, :auth_blocked} ->
+        Logger.warning("codex_exec turn skipped for #{issue_context(issue)}: auth realm blocked")
+        raise RuntimeError, "auth realm blocked for #{issue_context(issue)}"
+
+      {:error, :rate_limited} ->
+        Logger.warning("codex_exec turn skipped for #{issue_context(issue)}: auth realm rate-limited")
+        raise RuntimeError, "auth realm rate-limited for #{issue_context(issue)}"
+
+      {:error, reason} ->
+        Logger.warning("codex_exec run_turn failed for #{issue_context(issue)}: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
