@@ -5,6 +5,7 @@
 │ Runtime: 1m 15s
 │ Tokens: in 90 | out 12 | total 102
 │ Rate Limits: priority-tier | primary 100/100 reset 1s | secondary 500/500 reset 1s | credits unlimited
+│ State DB: clean
 │ Project: https://linear.app/project/project/issues
 │ Next refresh: n/a
 ├─ Running
@@ -12,6 +13,10 @@
 │   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │ ● MT-777   running        4242     1m 15s / 7        3,200 thre...567890  thread token usage updated (in 90, o...
+│
+├─ State DB reconciliation
+│
+│  No stale DB running rows or orphaned turn attempts
 │
 ├─ Backoff queue
 │
