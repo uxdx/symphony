@@ -15,13 +15,13 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 
 1. Polls Linear for candidate work
 2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+3. Ensures a long-lived `sazo-slave` lane exists for the configured chain
+4. Runs each turn through `codex exec --json` inside that lane and workspace
+5. Verifies the parsed turn protocol before marking the turn complete
+6. Keeps Codex working on the issue until the work is done
 
-During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
-skills can make raw Linear GraphQL calls.
+The older app-server path is still present for compatibility tests, but active CS Tool chains route
+through the cmux-backed `codex exec` backend.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
@@ -100,6 +100,7 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  exec_command: codex exec
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -114,6 +115,15 @@ Notes:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
+- Active cmux-backed chains use `codex.exec_command`, which defaults to `codex exec`. Set it when
+  you need deterministic model or CLI flags, for example:
+
+```yaml
+codex:
+  exec_command: "codex --config 'model=\"gpt-5.5\"' --config model_reasoning_effort=xhigh exec"
+```
+
+- `codex.command` remains the app-server command used by the legacy app-server runner and tests.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
@@ -128,10 +138,13 @@ Notes:
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.
+- Linear workflows must set either `tracker.project_slug` or `tracker.team_key`.
+- `tracker.required_labels` and `tracker.exclude_labels` are normalized case-insensitively before
+  polling so chain routing can be constrained by labels.
 - For path values, `~` is expanded to the home directory.
 - For env-backed path values, use `$VAR`. `workspace.root` resolves `$VAR` before path handling,
-  while `codex.command` stays a shell command string and any `$VAR` expansion there happens in the
-  launched shell.
+  while `codex.command` and `codex.exec_command` stay shell command strings and any `$VAR`
+  expansion there happens in the launched shell.
 
 ```yaml
 tracker:
@@ -150,6 +163,23 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+
+## Operational checks
+
+Run these checks before starting or restarting local launchd-managed Symphony chains:
+
+```bash
+mix workflow.check --file WORKFLOW.md
+mix release.check --pin <expected-commit>
+mix launchd.check --manifest-dir ../deploy/launchd --live-dir ~/Library/LaunchAgents
+mix ops.check --decision disabled --manifest-dir ../deploy/launchd --live-dir ~/Library/LaunchAgents
+```
+
+`workflow.check` validates the workflow contract, including Linear scope and label filters.
+`release.check` rejects dirty or unpinned restarts unless explicitly overridden and also verifies a
+built release commit file when provided. `launchd.check` compares repository launchd manifests with
+the live LaunchAgents directory. `ops.check` keeps the optional `symphony-ops` chain disabled unless
+its two-phase apply contract is explicitly satisfied.
 
 ## Web dashboard
 

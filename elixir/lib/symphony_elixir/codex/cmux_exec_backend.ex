@@ -18,6 +18,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   @behaviour SymphonyElixir.Agent.Backend
 
   alias SymphonyElixir.Cmux
+  alias SymphonyElixir.Config
   alias SymphonyElixir.Codex.ExecJsonParser
   alias SymphonyElixir.Linear.Mutate
   alias SymphonyElixir.State.{AuthRealms, Issues}
@@ -35,6 +36,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         session = %{
           chain: chain,
           cmux_module: cmux_module,
+          exec_command: Keyword.get(opts, :exec_command) || configured_exec_command(),
           lane: lane,
           workspace: workspace,
           session_id: Keyword.get(opts, :session_id)
@@ -105,8 +107,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
       case session.session_id do
         sid when is_binary(sid) and sid != "" ->
           [
-            "codex",
-            "exec",
+            exec_command(session),
             "resume",
             shell_quote(sid),
             "--json",
@@ -115,8 +116,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
 
         _ ->
           [
-            "codex",
-            "exec",
+            exec_command(session),
             "-C",
             shell_quote(session.workspace),
             "--json",
@@ -133,6 +133,25 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
 
     {body, prompt_path}
   end
+
+  defp configured_exec_command do
+    case Config.settings() do
+      {:ok, settings} ->
+        settings.codex.exec_command
+
+      {:error, _reason} ->
+        "codex exec"
+    end
+  end
+
+  defp exec_command(%{exec_command: command}) when is_binary(command) do
+    case String.trim(command) do
+      "" -> "codex exec"
+      value -> value
+    end
+  end
+
+  defp exec_command(_session), do: "codex exec"
 
   ## Internals
 

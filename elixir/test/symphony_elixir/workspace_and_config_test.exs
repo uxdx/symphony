@@ -810,6 +810,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
+    assert config.codex.exec_command == "codex exec"
 
     assert config.codex.approval_policy == %{
              "reject" => %{
@@ -838,11 +839,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.stall_timeout_ms == 300_000
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
+      codex_command: "codex --config 'model=\"gpt-5.5\"' app-server",
+      codex_exec_command: "codex --config 'model=\"gpt-5.5\"' exec"
     )
 
     assert Config.settings!().codex.command ==
              "codex --config 'model=\"gpt-5.5\"' app-server"
+
+    assert Config.settings!().codex.exec_command ==
+             "codex --config 'model=\"gpt-5.5\"' exec"
 
     explicit_root =
       Path.join(
@@ -950,6 +955,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "codex app-server")
     assert Config.settings!().codex.command == "codex app-server"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_exec_command: "codex exec")
+    assert Config.settings!().codex.exec_command == "codex exec"
   end
 
   test "config resolves $VAR references for env-backed secret and path values" do
@@ -973,13 +981,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
       workspace_root: "$#{workspace_env_var}",
-      codex_command: "#{codex_bin} app-server"
+      codex_command: "#{codex_bin} app-server",
+      codex_exec_command: "#{codex_bin} exec"
     )
 
     config = Config.settings!()
     assert config.tracker.api_key == api_key
     assert config.workspace.root == Path.expand(workspace_root)
     assert config.codex.command == "#{codex_bin} app-server"
+    assert config.codex.exec_command == "#{codex_bin} exec"
   end
 
   test "config no longer resolves legacy env: references" do
