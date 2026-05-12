@@ -22,7 +22,14 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0,
+          install_fake_sazo_slave!: 1,
+          install_fake_sazo_slave!: 2
+        ]
 
       setup do
         workflow_root =
@@ -69,6 +76,31 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
 
+  def install_fake_sazo_slave!(test_root, opts \\ []) do
+    path = Path.join(test_root, "fake-sazo-slave")
+    trace_file = Keyword.get(opts, :trace_file)
+    chain_name = Keyword.get(opts, :chain_name, "test-#{System.unique_integer([:positive])}")
+
+    previous_sazo_slave = System.get_env("SAZO_SLAVE_BIN")
+    previous_chain_name = System.get_env("SYMPHONY_CHAIN_NAME")
+    previous_linear_api_key = System.get_env("LINEAR_API_KEY")
+
+    File.write!(path, fake_sazo_slave_script(trace_file))
+    File.chmod!(path, 0o755)
+
+    System.put_env("SAZO_SLAVE_BIN", path)
+    System.put_env("SYMPHONY_CHAIN_NAME", chain_name)
+    System.delete_env("LINEAR_API_KEY")
+
+    ExUnit.Callbacks.on_exit(fn ->
+      restore_env("SAZO_SLAVE_BIN", previous_sazo_slave)
+      restore_env("SYMPHONY_CHAIN_NAME", previous_chain_name)
+      restore_env("LINEAR_API_KEY", previous_linear_api_key)
+    end)
+
+    path
+  end
+
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
            {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
@@ -88,6 +120,66 @@ defmodule SymphonyElixir.TestSupport do
     end
   end
 
+  defp fake_sazo_slave_script(trace_file) do
+    trace_file = if trace_file, do: shell_quote(trace_file), else: "\"\""
+
+    """
+    #!/bin/sh
+    trace_file=#{trace_file}
+    cmd="$1"
+    shift || true
+
+    case "$cmd" in
+      new)
+        printf '%s\\n' 'surface=surface:1'
+        exit 0
+        ;;
+      run-turn)
+        cmd_file=""
+
+        while [ "$#" -gt 0 ]; do
+          case "$1" in
+            --cmd-file)
+              shift
+              cmd_file="$1"
+              ;;
+          esac
+
+          shift || break
+        done
+
+        if [ "$trace_file" != "" ]; then
+          printf '%s\\n' 'RUN' >> "$trace_file"
+
+          if [ -n "$cmd_file" ] && [ -f "$cmd_file" ]; then
+            prompt_file="$(grep -Eo "< '[^']*'" "$cmd_file" | tail -n 1 | sed "s/^< '//; s/'$//")"
+
+            if [ -n "$prompt_file" ] && [ -f "$prompt_file" ]; then
+              printf '%s\\n' 'PROMPT_BEGIN' >> "$trace_file"
+              cat "$prompt_file" >> "$trace_file"
+              printf '\\n%s\\n' 'PROMPT_END' >> "$trace_file"
+            fi
+          fi
+        fi
+
+        printf '%s\\n' '{"type":"thread.started","thread_id":"thread-test"}'
+        printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2}}'
+        exit 0
+        ;;
+      close)
+        exit 0
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
+    """
+  end
+
+  defp shell_quote(value) when is_binary(value) do
+    "'" <> String.replace(value, "'", "'\\''") <> "'"
+  end
+
   defp workflow_content(overrides) do
     config =
       Keyword.merge(
@@ -96,7 +188,10 @@ defmodule SymphonyElixir.TestSupport do
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
           tracker_project_slug: "project",
+          tracker_team_key: nil,
           tracker_assignee: nil,
+          tracker_required_labels: [],
+          tracker_exclude_labels: [],
           tracker_active_states: ["Todo", "In Progress"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
@@ -133,7 +228,10 @@ defmodule SymphonyElixir.TestSupport do
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
+    tracker_team_key = Keyword.get(config, :tracker_team_key)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
+    tracker_required_labels = Keyword.get(config, :tracker_required_labels)
+    tracker_exclude_labels = Keyword.get(config, :tracker_exclude_labels)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
@@ -171,7 +269,10 @@ defmodule SymphonyElixir.TestSupport do
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
+        "  team_key: #{yaml_value(tracker_team_key)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
+        "  required_labels: #{yaml_value(tracker_required_labels)}",
+        "  exclude_labels: #{yaml_value(tracker_exclude_labels)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",

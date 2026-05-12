@@ -83,7 +83,8 @@ defmodule SymphonyElixir.State do
   so it is safe to call from within a `transaction/2` callback (which runs on
   the State process and would otherwise deadlock on a self-call).
   """
-  @spec boot_run_id() :: pos_integer()
+  @spec boot_run_id() :: non_neg_integer()
+  @spec boot_run_id(GenServer.name()) :: non_neg_integer()
   def boot_run_id(_server \\ __MODULE__) do
     :persistent_term.get({__MODULE__, :boot_run_id}, 0)
   end
@@ -96,6 +97,7 @@ defmodule SymphonyElixir.State do
   raise to roll back).
   """
   @spec transaction((reference() -> any())) :: {:ok, any()} | {:error, term()}
+  @spec transaction(GenServer.name(), (reference() -> any())) :: {:ok, any()} | {:error, term()}
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
     GenServer.call(server, {:transaction, fun}, 30_000)
   end
@@ -108,6 +110,22 @@ defmodule SymphonyElixir.State do
     {:row, [seq]} = Sqlite3.step(conn, stmt)
     :ok = Sqlite3.release(conn, stmt)
     {:ok, seq}
+  end
+
+  @doc """
+  Reconcile stale `turn_running` rows owned by a previous BEAM boot.
+
+  The current boot owns all live turns. Any persisted `turn_running` row whose
+  `owner_boot_run_id` differs from the current boot is an orphan from a crashed
+  or stopped process and is downgraded to `retryable_failed`.
+  """
+  @spec reconcile_stale_turn_running() :: {:ok, %{count: non_neg_integer(), issue_ids: [String.t()]}} | {:error, term()}
+  def reconcile_stale_turn_running do
+    current_boot_run_id = boot_run_id()
+
+    transaction(fn conn ->
+      reconcile_stale_turn_running!(conn, current_boot_run_id, "manual")
+    end)
   end
 
   @doc """
@@ -142,10 +160,13 @@ defmodule SymphonyElixir.State do
 
     boot = insert_boot_run!(conn)
     :persistent_term.put({__MODULE__, :boot_run_id}, boot.boot_run_id)
+    stale = reconcile_stale_turn_running!(conn, boot.boot_run_id, "boot")
 
-    Logger.info(
-      "[symphony-state] db=#{db_path} boot_run_id=#{boot.boot_run_id} pid=#{boot.pid}"
-    )
+    Logger.info("[symphony-state] db=#{db_path} boot_run_id=#{boot.boot_run_id} pid=#{boot.pid}")
+
+    if stale.count > 0 do
+      Logger.warning("[symphony-state] reconciled #{stale.count} stale turn_running row(s)")
+    end
 
     {:ok, %{conn: conn, db_path: db_path, boot: boot}}
   end
@@ -178,10 +199,12 @@ defmodule SymphonyElixir.State do
 
   defp insert_boot_run!(conn) do
     pid_int = String.to_integer(System.pid())
-    hostname = case :inet.gethostname() do
-      {:ok, h} -> List.to_string(h)
-      _ -> "unknown"
-    end
+
+    hostname =
+      case :inet.gethostname() do
+        {:ok, h} -> List.to_string(h)
+        _ -> "unknown"
+      end
 
     started_at = System.system_time(:second)
 
@@ -201,6 +224,127 @@ defmodule SymphonyElixir.State do
       pid: pid_int,
       hostname: hostname
     }
+  end
+
+  defp reconcile_stale_turn_running!(conn, current_boot_run_id, reconciled_by) do
+    now = System.system_time(:second)
+    rows = stale_turn_running_rows(conn, current_boot_run_id)
+
+    Enum.each(rows, fn row ->
+      {:ok, fence_seq} = allocate_fence(conn)
+
+      :ok =
+        update_stale_issue!(
+          conn,
+          row.issue_id,
+          row.attempt_id,
+          fence_seq,
+          now
+        )
+
+      :ok = update_stale_turn_attempt!(conn, row.issue_id, row.attempt_id, now)
+
+      insert_event!(conn, %{
+        ts: now,
+        boot_run_id: current_boot_run_id,
+        fence_seq: fence_seq,
+        issue_id: row.issue_id,
+        turn_id: row.current_turn_id,
+        chain: row.chain,
+        kind: "retryable_failed",
+        payload: %{
+          reason: :stale_turn_running,
+          details: %{
+            reconciled_by: reconciled_by,
+            previous_owner_boot_run_id: row.owner_boot_run_id,
+            attempt_id: row.attempt_id
+          }
+        }
+      })
+    end)
+
+    %{count: length(rows), issue_ids: Enum.map(rows, & &1.issue_id)}
+  end
+
+  defp stale_turn_running_rows(conn, current_boot_run_id) do
+    {:ok, stmt} =
+      Sqlite3.prepare(
+        conn,
+        """
+        SELECT issue_id, chain, attempt_id, owner_boot_run_id, current_turn_id
+          FROM issues
+         WHERE state = 'turn_running'
+           AND (owner_boot_run_id IS NULL OR owner_boot_run_id != ?)
+         ORDER BY last_event_at ASC
+        """
+      )
+
+    :ok = Sqlite3.bind(stmt, [current_boot_run_id])
+    rows = collect_stale_turn_rows(conn, stmt, [])
+    :ok = Sqlite3.release(conn, stmt)
+    rows
+  end
+
+  defp collect_stale_turn_rows(conn, stmt, acc) do
+    case Sqlite3.step(conn, stmt) do
+      {:row, [issue_id, chain, attempt_id, owner_boot_run_id, current_turn_id]} ->
+        collect_stale_turn_rows(conn, stmt, [
+          %{
+            issue_id: issue_id,
+            chain: chain,
+            attempt_id: attempt_id,
+            owner_boot_run_id: owner_boot_run_id,
+            current_turn_id: current_turn_id
+          }
+          | acc
+        ])
+
+      :done ->
+        Enum.reverse(acc)
+    end
+  end
+
+  defp update_stale_issue!(conn, issue_id, attempt_id, fence_seq, now) do
+    {:ok, stmt} =
+      Sqlite3.prepare(
+        conn,
+        """
+        UPDATE issues
+           SET state               = 'retryable_failed',
+               retry_next_at       = ?,
+               last_failure_reason = 'stale_turn_running',
+               owner_boot_run_id   = NULL,
+               claim_expires_at    = NULL,
+               fence_seq           = ?,
+               current_turn_id     = NULL,
+               last_event_at       = ?,
+               last_event_kind     = 'retryable_failed'
+         WHERE issue_id = ? AND attempt_id = ? AND state = 'turn_running'
+        """
+      )
+
+    :ok = Sqlite3.bind(stmt, [now, fence_seq, now, issue_id, attempt_id])
+    :done = Sqlite3.step(conn, stmt)
+    :ok = Sqlite3.release(conn, stmt)
+  end
+
+  defp update_stale_turn_attempt!(conn, issue_id, attempt_id, now) do
+    {:ok, stmt} =
+      Sqlite3.prepare(
+        conn,
+        """
+        UPDATE turn_attempts
+           SET state       = 'failed',
+               reason      = 'stale_turn_running',
+               error_class = 'stale_turn_running',
+               ended_at    = ?
+         WHERE issue_id = ? AND attempt_id = ?
+        """
+      )
+
+    :ok = Sqlite3.bind(stmt, [now, issue_id, attempt_id])
+    :done = Sqlite3.step(conn, stmt)
+    :ok = Sqlite3.release(conn, stmt)
   end
 
   defp insert_event!(conn, ev) do
@@ -229,9 +373,14 @@ defmodule SymphonyElixir.State do
     :ok = Sqlite3.release(conn, stmt)
 
     append_event_wal(%{
-      ts: ts, boot_run_id: boot_run_id, fence_seq: fence_seq,
-      issue_id: issue_id, turn_id: turn_id, chain: chain,
-      kind: kind, payload: Map.get(ev, :payload, %{})
+      ts: ts,
+      boot_run_id: boot_run_id,
+      fence_seq: fence_seq,
+      issue_id: issue_id,
+      turn_id: turn_id,
+      chain: chain,
+      kind: kind,
+      payload: Map.get(ev, :payload, %{})
     })
 
     :ok

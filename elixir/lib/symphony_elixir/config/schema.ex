@@ -42,6 +42,8 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    alias SymphonyElixir.Config.Schema
+
     @primary_key false
 
     embedded_schema do
@@ -49,7 +51,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:team_key, :string)
       field(:assignee, :string)
+      field(:required_labels, {:array, :string}, default: [])
+      field(:exclude_labels, {:array, :string}, default: [])
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
@@ -59,9 +64,25 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :team_key,
+          :assignee,
+          :required_labels,
+          :exclude_labels,
+          :active_states,
+          :terminal_states
+        ],
         empty_values: []
       )
+      |> Schema.validate_label_list(:required_labels)
+      |> Schema.validate_label_list(:exclude_labels)
+      |> update_change(:required_labels, &Schema.normalize_label_names/1)
+      |> update_change(:exclude_labels, &Schema.normalize_label_names/1)
+      |> Schema.validate_disjoint_label_filters(:required_labels, :exclude_labels)
     end
   end
 
@@ -325,6 +346,25 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   @doc false
+  @spec normalize_label_name(String.t()) :: String.t()
+  def normalize_label_name(label_name) when is_binary(label_name) do
+    label_name
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  @doc false
+  @spec normalize_label_names([String.t()] | nil) :: [String.t()]
+  def normalize_label_names(nil), do: []
+
+  def normalize_label_names(label_names) when is_list(label_names) do
+    label_names
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&normalize_label_name/1)
+    |> Enum.uniq()
+  end
+
+  @doc false
   @spec normalize_state_limits(nil | map()) :: map()
   def normalize_state_limits(nil), do: %{}
 
@@ -351,6 +391,45 @@ defmodule SymphonyElixir.Config.Schema do
         end
       end)
     end)
+  end
+
+  @doc false
+  @spec validate_label_list(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_label_list(changeset, field) do
+    validate_change(changeset, field, fn ^field, labels ->
+      Enum.flat_map(labels, fn label ->
+        cond do
+          not is_binary(label) ->
+            [{field, "labels must be strings"}]
+
+          String.trim(label) == "" ->
+            [{field, "labels must not be blank"}]
+
+          true ->
+            []
+        end
+      end)
+    end)
+  end
+
+  @doc false
+  @spec validate_disjoint_label_filters(Ecto.Changeset.t(), atom(), atom()) :: Ecto.Changeset.t()
+  def validate_disjoint_label_filters(changeset, required_field, exclude_field) do
+    required_labels = MapSet.new(get_field(changeset, required_field) || [])
+    exclude_labels = MapSet.new(get_field(changeset, exclude_field) || [])
+
+    overlap =
+      required_labels
+      |> MapSet.intersection(exclude_labels)
+      |> MapSet.to_list()
+
+    case overlap do
+      [] ->
+        changeset
+
+      labels ->
+        add_error(changeset, exclude_field, "must not overlap required_labels: #{Enum.join(labels, ", ")}")
+    end
   end
 
   defp changeset(attrs) do

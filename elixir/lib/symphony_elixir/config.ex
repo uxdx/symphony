@@ -44,7 +44,7 @@ defmodule SymphonyElixir.Config do
         settings
 
       {:error, reason} ->
-        raise ArgumentError, message: format_config_error(reason)
+        raise ArgumentError, message: format_error(reason)
     end
   end
 
@@ -98,6 +98,41 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec format_error(term()) :: String.t()
+  def format_error(reason) do
+    case reason do
+      {:invalid_workflow_config, message} ->
+        "Invalid WORKFLOW.md config: #{message}"
+
+      {:missing_workflow_file, path, raw_reason} ->
+        "Missing WORKFLOW.md at #{path}: #{inspect(raw_reason)}"
+
+      {:workflow_parse_error, raw_reason} ->
+        "Failed to parse WORKFLOW.md: #{inspect(raw_reason)}"
+
+      :workflow_front_matter_not_a_map ->
+        "Failed to parse WORKFLOW.md: workflow front matter must decode to a map"
+
+      :missing_tracker_kind ->
+        "Tracker kind missing; set tracker.kind"
+
+      {:unsupported_tracker_kind, kind} ->
+        "Unsupported tracker kind: #{inspect(kind)}"
+
+      :missing_linear_api_token ->
+        "Linear API token missing; set tracker.api_key or LINEAR_API_KEY"
+
+      :missing_linear_tracker_scope ->
+        "Linear tracker scope missing; set tracker.project_slug or tracker.team_key"
+
+      :missing_linear_project_slug ->
+        "Linear tracker scope missing; set tracker.project_slug or tracker.team_key"
+
+      other ->
+        "Invalid WORKFLOW.md config: #{inspect(other)}"
+    end
+  end
+
   @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
@@ -125,30 +160,18 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
+      settings.tracker.kind == "linear" and not has_linear_tracker_scope?(settings.tracker) ->
+        {:error, :missing_linear_tracker_scope}
 
       true ->
         :ok
     end
   end
 
-  defp format_config_error(reason) do
-    case reason do
-      {:invalid_workflow_config, message} ->
-        "Invalid WORKFLOW.md config: #{message}"
-
-      {:missing_workflow_file, path, raw_reason} ->
-        "Missing WORKFLOW.md at #{path}: #{inspect(raw_reason)}"
-
-      {:workflow_parse_error, raw_reason} ->
-        "Failed to parse WORKFLOW.md: #{inspect(raw_reason)}"
-
-      :workflow_front_matter_not_a_map ->
-        "Failed to parse WORKFLOW.md: workflow front matter must decode to a map"
-
-      other ->
-        "Invalid WORKFLOW.md config: #{inspect(other)}"
-    end
+  defp has_linear_tracker_scope?(tracker) do
+    present_string?(tracker.project_slug) or present_string?(tracker.team_key)
   end
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
 end

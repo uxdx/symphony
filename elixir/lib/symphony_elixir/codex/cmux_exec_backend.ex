@@ -21,17 +21,20 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   alias SymphonyElixir.Codex.ExecJsonParser
   alias SymphonyElixir.Linear.Mutate
   alias SymphonyElixir.State.{AuthRealms, Issues}
+  alias SymphonyElixir.Verification
 
   require Logger
 
   @impl true
   def start_session(workspace, opts) do
     chain = Keyword.fetch!(opts, :chain_name)
+    cmux_module = Keyword.get(opts, :cmux_module, Cmux)
 
-    case Cmux.ensure_lane(chain, workspace, agent: "shell") do
+    case cmux_module.ensure_lane(chain, workspace, agent: "shell") do
       {:ok, lane} ->
         session = %{
           chain: chain,
+          cmux_module: cmux_module,
           lane: lane,
           workspace: workspace,
           session_id: Keyword.get(opts, :session_id)
@@ -80,11 +83,14 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   end
 
   @impl true
-  def stop_session(%{chain: chain}) do
-    Cmux.close_lane(chain)
+  def stop_session(%{chain: chain} = session) do
+    session
+    |> Map.get(:cmux_module, Cmux)
+    |> apply(:close_lane, [chain])
   end
 
   @doc false
+  @spec build_codex_exec_cmd(map(), String.t()) :: {String.t(), Path.t()}
   def build_codex_exec_cmd(session, prompt) do
     prompt_path =
       Path.join(
@@ -99,14 +105,21 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
       case session.session_id do
         sid when is_binary(sid) and sid != "" ->
           [
-            "codex", "exec", "resume", shell_quote(sid),
+            "codex",
+            "exec",
+            "resume",
+            shell_quote(sid),
+            "--json",
             "--dangerously-bypass-approvals-and-sandbox"
           ]
 
         _ ->
           [
-            "codex", "exec",
-            "-C", shell_quote(session.workspace),
+            "codex",
+            "exec",
+            "-C",
+            shell_quote(session.workspace),
+            "--json",
             "--dangerously-bypass-approvals-and-sandbox"
           ]
       end
@@ -152,7 +165,9 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
     opts = Keyword.fetch!(ctx, :opts)
     state_required? = Keyword.fetch!(ctx, :state_required?)
 
-    case Cmux.run_turn(chain,
+    cmux_module = Map.get(session, :cmux_module, Cmux)
+
+    case cmux_module.run_turn(chain,
            workspace: workspace,
            turn_id: turn_id,
            attempt_id: attempt_id,
@@ -164,32 +179,54 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         events = ExecJsonParser.parse(raw_stdout)
         Enum.each(events, fn ev -> on_message.(%{event: :codex_exec_event, data: ev}) end)
 
-        # exit 0 → success regardless of JSON events (supports both --json and plain-text mode)
-        summary = events |> ExecJsonParser.summarize() |> Map.put(:success, true)
+        summary = ExecJsonParser.summarize(events)
         new_sid = summary[:session_id] || session.session_id
 
-        if state_required? and not is_nil(issue_key) do
-          :ok =
-            Issues.complete_turn(issue_key, %{
-              attempt_id: attempt_id,
-              turn_id: turn_id,
-              chain: chain,
-              session_id: new_sid,
-              summary: summary
-            })
+        verification_context = %{
+          issue_id: issue_key,
+          chain: chain,
+          workspace: workspace,
+          backend: "codex_cmux_exec",
+          summary: summary
+        }
 
-          :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        case Verification.verify_turn(verification_context) do
+          {:ok, verification} ->
+            summary = summary |> Map.put(:verification, verification) |> Map.put(:session_id, new_sid)
+
+            if state_required? and not is_nil(issue_key) do
+              :ok =
+                Issues.complete_turn(issue_key, %{
+                  attempt_id: attempt_id,
+                  turn_id: turn_id,
+                  chain: chain,
+                  session_id: new_sid,
+                  summary: summary
+                })
+
+              :ok = Mutate.post_turn_comment(issue_key, chain, summary)
+            end
+
+            new_session = %{session | session_id: new_sid}
+            {:ok, summary, new_session}
+
+          {:error, verification} ->
+            Logger.warning("[codex_cmux] verifier failed reason=#{verification.reason} chain=#{chain}")
+
+            if state_required? and not is_nil(issue_key) do
+              handle_turn_failure(issue_key, turn_id, attempt_id, chain, Verification.failure_reason(verification), %{
+                verification: verification,
+                summary: summary
+              })
+            end
+
+            {:error, {:verification_failed, verification}}
         end
-
-        new_session = %{session | session_id: new_sid}
-        {:ok, Map.put(summary, :session_id, new_sid), new_session}
 
       {:error, reason} ->
         classified = classify_error(reason)
 
-        Logger.warning(
-          "[codex_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}"
-        )
+        Logger.warning("[codex_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}")
 
         if state_required? and not is_nil(issue_key) do
           handle_turn_failure(issue_key, turn_id, attempt_id, chain, classified)
@@ -216,14 +253,14 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
 
     cond do
       String.contains?(tail, "TokenRefreshFailed") or
-          String.contains?(tail, "invalid_grant") or
-          String.contains?(tail, "auth_required") or
+        String.contains?(tail, "invalid_grant") or
+        String.contains?(tail, "auth_required") or
           String.contains?(tail, "Not logged in") ->
         :auth_revoked
 
       String.contains?(tail, "Rate limit exceeded") or
-          String.contains?(tail, "Too Many Requests") or
-          String.contains?(tail, "rate_limit_exceeded") or
+        String.contains?(tail, "Too Many Requests") or
+        String.contains?(tail, "rate_limit_exceeded") or
           String.contains?(tail, "HTTP 429") ->
         :rate_limit
 
@@ -240,7 +277,9 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
     for <<c::utf8 <- str>>, into: "", do: <<c::utf8>>
   end
 
-  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :auth_revoked) do
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason, details \\ nil)
+
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :auth_revoked, details) do
     :ok = AuthRealms.block(AuthRealms.default_realm())
 
     {:ok, _} =
@@ -248,11 +287,12 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         attempt_id: attempt_id,
         turn_id: turn_id,
         chain: chain,
-        reason: :auth_revoked
+        reason: :auth_revoked,
+        details: details
       })
   end
 
-  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :rate_limit) do
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :rate_limit, details) do
     retry_at = System.system_time(:second) + 3600
     :ok = AuthRealms.throttle(AuthRealms.default_realm(), retry_at)
 
@@ -261,17 +301,19 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         attempt_id: attempt_id,
         turn_id: turn_id,
         chain: chain,
-        reason: :rate_limit
+        reason: :rate_limit,
+        details: details
       })
   end
 
-  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason) do
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason, details) do
     {:ok, _} =
       Issues.fail_turn(issue_key, %{
         attempt_id: attempt_id,
         turn_id: turn_id,
         chain: chain,
-        reason: reason
+        reason: reason,
+        details: details
       })
   end
 

@@ -3,6 +3,7 @@ defmodule SymphonyElixir.State.IssuesTest do
   # Each test uses a unique issue_id so rows do not collide.
   use ExUnit.Case, async: false
 
+  alias Exqlite.Sqlite3
   alias SymphonyElixir.State
   alias SymphonyElixir.State.Issues
 
@@ -156,6 +157,60 @@ defmodule SymphonyElixir.State.IssuesTest do
     end
   end
 
+  describe "reconcile_stale_turn_running/0" do
+    test "downgrades previous-boot turn_running rows to retryable_failed" do
+      issue_id = unique_issue_id("stale-running")
+
+      {:ok, %{attempt_id: attempt_id}} = Issues.begin_turn(issue_id, "c-stale-running")
+
+      {:ok, :ok} =
+        State.transaction(fn conn ->
+          exec!(conn, "UPDATE issues SET owner_boot_run_id = 0 WHERE issue_id = ?", [issue_id])
+        end)
+
+      assert {:ok, %{issue_ids: issue_ids}} = State.reconcile_stale_turn_running()
+      assert issue_id in issue_ids
+
+      assert {:ok, row} = Issues.get(issue_id)
+      assert row.state == "retryable_failed"
+      assert row.last_failure_reason == "stale_turn_running"
+      assert is_nil(row.owner_boot_run_id)
+      assert is_nil(row.current_turn_id)
+
+      assert {:ok, %{state: "failed", reason: "stale_turn_running"}} =
+               fetch_turn_attempt(issue_id, attempt_id)
+    end
+
+    test "does not alter current-boot or completed rows" do
+      current_issue_id = unique_issue_id("current-running")
+      completed_issue_id = unique_issue_id("completed")
+
+      {:ok, _} = Issues.begin_turn(current_issue_id, "c-current-running")
+
+      {:ok, %{turn_id: turn_id, attempt_id: attempt_id}} =
+        Issues.begin_turn(completed_issue_id, "c-completed")
+
+      assert :ok =
+               Issues.complete_turn(completed_issue_id, %{
+                 attempt_id: attempt_id,
+                 turn_id: turn_id,
+                 chain: "c-completed",
+                 session_id: "sess-completed",
+                 summary: %{success: true}
+               })
+
+      assert {:ok, %{issue_ids: issue_ids}} = State.reconcile_stale_turn_running()
+      refute current_issue_id in issue_ids
+      refute completed_issue_id in issue_ids
+
+      assert {:ok, current_row} = Issues.get(current_issue_id)
+      assert current_row.state == "turn_running"
+
+      assert {:ok, completed_row} = Issues.get(completed_issue_id)
+      assert completed_row.state == "completed"
+    end
+  end
+
   describe "in_flight/0" do
     test "returns issues whose state is not completed/quarantined" do
       issue_id = unique_issue_id("inflight")
@@ -164,5 +219,32 @@ defmodule SymphonyElixir.State.IssuesTest do
       ids = Enum.map(Issues.in_flight(), & &1.issue_id)
       assert issue_id in ids
     end
+  end
+
+  defp fetch_turn_attempt(issue_id, attempt_id) do
+    State.transaction(fn conn ->
+      {:ok, stmt} =
+        Sqlite3.prepare(
+          conn,
+          "SELECT state, reason FROM turn_attempts WHERE issue_id = ? AND attempt_id = ?"
+        )
+
+      :ok = Sqlite3.bind(stmt, [issue_id, attempt_id])
+      result = Sqlite3.step(conn, stmt)
+      :ok = Sqlite3.release(conn, stmt)
+
+      case result do
+        {:row, [state, reason]} -> %{state: state, reason: reason}
+        :done -> nil
+      end
+    end)
+  end
+
+  defp exec!(conn, sql, params) do
+    {:ok, stmt} = Sqlite3.prepare(conn, sql)
+    :ok = Sqlite3.bind(stmt, params)
+    :done = Sqlite3.step(conn, stmt)
+    :ok = Sqlite3.release(conn, stmt)
+    :ok
   end
 end

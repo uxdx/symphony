@@ -46,7 +46,29 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: nil
     )
 
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_tracker_scope} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      tracker_team_key: "AGT1",
+      tracker_required_labels: [" Ready ", "READY"],
+      tracker_exclude_labels: ["Needs Human"]
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.team_key == "AGT1"
+    assert Config.settings!().tracker.required_labels == ["ready"]
+    assert Config.settings!().tracker.exclude_labels == ["needs human"]
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels: ["ready"],
+      tracker_exclude_labels: ["Ready"]
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "tracker.exclude_labels"
+    assert message =~ "must not overlap required_labels"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",
@@ -543,6 +565,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    scheduled_from_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -551,7 +574,7 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_delay_in_range(due_at_ms, scheduled_from_ms, 1_000, 1_500)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -584,6 +607,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    scheduled_from_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -591,7 +615,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_delay_in_range(due_at_ms, scheduled_from_ms, 40_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -623,6 +647,7 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    scheduled_from_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
@@ -630,7 +655,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_delay_in_range(due_at_ms, scheduled_from_ms, 10_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -750,11 +775,11 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+  defp assert_due_delay_in_range(due_at_ms, scheduled_from_ms, min_delay_ms, max_delay_ms) do
+    delay_ms = due_at_ms - scheduled_from_ms
 
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+    assert delay_ms >= min_delay_ms
+    assert delay_ms <= max_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1039,6 +1064,7 @@ defmodule SymphonyElixir.CoreTest do
       """)
 
       File.chmod!(codex_binary, 0o755)
+      install_fake_sazo_slave!(test_root)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -1076,7 +1102,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "agent runner forwards timestamped codex updates to recipient" do
+  test "agent runner forwards codex exec events to recipient" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1124,6 +1150,7 @@ defmodule SymphonyElixir.CoreTest do
       )
 
       File.chmod!(codex_binary, 0o755)
+      install_fake_sazo_slave!(test_root)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -1152,13 +1179,12 @@ defmodule SymphonyElixir.CoreTest do
 
       assert_receive {:codex_worker_update, "issue-live-updates",
                       %{
-                        event: :session_started,
-                        timestamp: %DateTime{},
-                        session_id: session_id
+                        event: :codex_exec_event,
+                        data: %{"type" => "thread.started", "thread_id" => session_id}
                       }},
                      500
 
-      assert session_id == "thread-live-turn-live"
+      assert session_id == "thread-test"
     after
       File.rm_rf(test_root)
     end
@@ -1287,9 +1313,7 @@ defmodule SymphonyElixir.CoreTest do
       """)
 
       File.chmod!(codex_binary, 0o755)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-
-      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+      install_fake_sazo_slave!(test_root, trace_file: trace_file)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -1338,21 +1362,10 @@ defmodule SymphonyElixir.CoreTest do
       assert_receive {:issue_state_fetch, 1}
       assert_receive {:issue_state_fetch, 2}
 
-      lines = File.read!(trace_file) |> String.split("\n", trim: true)
+      trace = File.read!(trace_file)
+      assert length(Regex.scan(~r/^RUN$/m, trace)) == 2
 
-      assert length(Enum.filter(lines, &String.starts_with?(&1, "RUN:"))) == 1
-      assert length(Enum.filter(lines, &String.contains?(&1, "\"method\":\"thread/start\""))) == 1
-
-      turn_texts =
-        lines
-        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
-        |> Enum.map(&String.trim_leading(&1, "JSON:"))
-        |> Enum.map(&Jason.decode!/1)
-        |> Enum.filter(&(&1["method"] == "turn/start"))
-        |> Enum.map(fn payload ->
-          get_in(payload, ["params", "input"])
-          |> Enum.map_join("\n", &Map.get(&1, "text", ""))
-        end)
+      turn_texts = fake_sazo_prompts(trace)
 
       assert length(turn_texts) == 2
       assert Enum.at(turn_texts, 0) =~ "You are an agent for this repository."
@@ -1360,7 +1373,6 @@ defmodule SymphonyElixir.CoreTest do
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
     after
-      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end
@@ -1417,9 +1429,7 @@ defmodule SymphonyElixir.CoreTest do
       """)
 
       File.chmod!(codex_binary, 0o755)
-      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
-
-      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+      install_fake_sazo_slave!(test_root, trace_file: trace_file)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -1454,10 +1464,9 @@ defmodule SymphonyElixir.CoreTest do
       assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
 
       trace = File.read!(trace_file)
-      assert length(String.split(trace, "RUN", trim: true)) == 1
-      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+      assert length(Regex.scan(~r/^RUN$/m, trace)) == 2
+      assert length(fake_sazo_prompts(trace)) == 2
     after
-      System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
     end
   end
@@ -1815,5 +1824,16 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp fake_sazo_prompts(trace) do
+    trace
+    |> String.split("PROMPT_BEGIN\n")
+    |> Enum.drop(1)
+    |> Enum.map(fn chunk ->
+      chunk
+      |> String.split("\nPROMPT_END", parts: 2)
+      |> hd()
+    end)
   end
 end

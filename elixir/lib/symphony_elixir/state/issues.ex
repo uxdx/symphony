@@ -259,6 +259,10 @@ defmodule SymphonyElixir.State.Issues do
           attempt_id
         ])
 
+        payload =
+          %{reason: reason, retry_budget_used: new_used, retry_next_at: retry_next_at}
+          |> maybe_put_payload_details(Map.get(info, :details))
+
         :ok = insert_event_in_tx(conn, %{
           ts: now,
           boot_run_id: boot_run_id,
@@ -267,7 +271,7 @@ defmodule SymphonyElixir.State.Issues do
           turn_id: Map.get(info, :turn_id),
           chain: Map.get(info, :chain),
           kind: next_state,
-          payload: %{reason: reason, retry_budget_used: new_used, retry_next_at: retry_next_at}
+          payload: payload
         })
 
         %{state: next_state, retry_budget_used: new_used, retry_next_at: retry_next_at}
@@ -518,4 +522,7 @@ defmodule SymphonyElixir.State.Issues do
   defp normalize_tx_result({:error, {%SymphonyElixir.State.Issues.StaleStateError{} = e, _}}),
     do: {:error, {:stale_state, e}}
   defp normalize_tx_result({:error, reason}), do: {:error, reason}
+
+  defp maybe_put_payload_details(payload, nil), do: payload
+  defp maybe_put_payload_details(payload, details), do: Map.put(payload, :details, details)
 end

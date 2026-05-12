@@ -4,15 +4,12 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Claude.CmuxPrintBackend
   alias SymphonyElixir.Codex.CmuxExecBackend
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   # PR7b chain routing:
-  #   todo-code, changes-requested-code  → CmuxPrintBackend (claude --print)
-  #   code-review-codex, in-review-qa    → CmuxExecBackend  (codex exec)
+  #   all active CS Tool chains -> CmuxExecBackend (codex exec)
   # AppServer is retained for fallback/testing but not reached by any active chain.
-  @cmux_print_chains ~w(todo-code changes-requested-code)
 
   @type worker_host :: String.t() | nil
 
@@ -85,12 +82,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     chain = current_chain_name()
-
-    if chain in @cmux_print_chains do
-      run_cmux_print_turns(workspace, issue, codex_update_recipient, opts, chain)
-    else
-      run_codex_exec_turns(workspace, issue, codex_update_recipient, opts, chain || worker_host)
-    end
+    run_codex_exec_turns(workspace, issue, codex_update_recipient, opts, chain || worker_host)
   end
 
   defp current_chain_name do
@@ -164,73 +156,6 @@ defmodule SymphonyElixir.AgentRunner do
 
       {:error, reason} ->
         Logger.warning("codex_exec run_turn failed for #{issue_context(issue)}: #{inspect(reason)}")
-        {:error, reason}
-    end
-  end
-
-  defp run_cmux_print_turns(workspace, issue, codex_update_recipient, opts, chain) do
-    max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
-    issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
-
-    Logger.info("Routing #{issue_context(issue)} to CmuxPrintBackend (chain=#{chain})")
-
-    with {:ok, session} <- CmuxPrintBackend.start_session(workspace, chain_name: chain) do
-      try do
-        do_run_cmux_print_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        CmuxPrintBackend.stop_session(session)
-      end
-    end
-  end
-
-  defp do_run_cmux_print_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
-
-    case CmuxPrintBackend.run_turn(session, prompt, issue,
-           on_message: codex_message_handler(codex_update_recipient, issue)
-         ) do
-      {:ok, summary, new_session} ->
-        Logger.info(
-          "Completed cmux_print turn for #{issue_context(issue)} session_id=#{summary[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}"
-        )
-
-        case continue_with_issue?(issue, issue_state_fetcher) do
-          {:continue, refreshed_issue} when turn_number < max_turns ->
-            do_run_cmux_print_turns(
-              new_session,
-              workspace,
-              refreshed_issue,
-              codex_update_recipient,
-              opts,
-              issue_state_fetcher,
-              turn_number + 1,
-              max_turns
-            )
-
-          {:continue, refreshed_issue} ->
-            Logger.info(
-              "Reached agent.max_turns for #{issue_context(refreshed_issue)} (cmux_print) — returning control to orchestrator"
-            )
-
-            :ok
-
-          {:done, _refreshed_issue} ->
-            :ok
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-
-      {:error, :auth_blocked} ->
-        Logger.warning("cmux_print turn skipped for #{issue_context(issue)}: auth realm blocked")
-        raise RuntimeError, "auth realm blocked for #{issue_context(issue)}"
-
-      {:error, :rate_limited} ->
-        Logger.warning("cmux_print turn skipped for #{issue_context(issue)}: auth realm rate-limited")
-        raise RuntimeError, "auth realm rate-limited for #{issue_context(issue)}"
-
-      {:error, reason} ->
-        Logger.warning("cmux_print run_turn failed for #{issue_context(issue)}: #{inspect(reason)}")
         {:error, reason}
     end
   end

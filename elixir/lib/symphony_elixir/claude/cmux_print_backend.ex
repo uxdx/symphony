@@ -26,17 +26,20 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   alias SymphonyElixir.Linear.Mutate
   alias SymphonyElixir.State.Issues
   alias SymphonyElixir.State.AuthRealms
+  alias SymphonyElixir.Verification
 
   require Logger
 
   @impl true
   def start_session(workspace, opts) do
     chain = Keyword.fetch!(opts, :chain_name)
+    cmux_module = Keyword.get(opts, :cmux_module, Cmux)
 
-    case Cmux.ensure_lane(chain, workspace, agent: "shell") do
+    case cmux_module.ensure_lane(chain, workspace, agent: "shell") do
       {:ok, lane} ->
         session = %{
           chain: chain,
+          cmux_module: cmux_module,
           lane: lane,
           workspace: workspace,
           session_id: Keyword.get(opts, :session_id)
@@ -85,11 +88,14 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   end
 
   @impl true
-  def stop_session(%{chain: chain}) do
-    Cmux.close_lane(chain)
+  def stop_session(%{chain: chain} = session) do
+    session
+    |> Map.get(:cmux_module, Cmux)
+    |> apply(:close_lane, [chain])
   end
 
   @doc false
+  @spec generate_turn_id(term()) :: String.t()
   def generate_turn_id(issue) do
     base =
       case issue do
@@ -112,6 +118,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   #     multi-turn loops live above (PR3 do_run_codex_turns analogue)
   #   - `--turn-timeout` does not exist → controlled by sazo-slave --timeout
   @doc false
+  @spec build_claude_print_cmd(map(), String.t(), keyword()) :: {String.t(), Path.t()}
   def build_claude_print_cmd(session, prompt, opts) do
     prompt_path =
       Path.join(
@@ -166,8 +173,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     * `:rate_limit` — stdout contains "rate limit" / "429" / "quota"
     * `:unknown` — anything else
   """
-  @spec classify_error(term()) :: :turn_timeout | :sentinel_missing | :nonce_mismatch
-                                     | :auth_revoked | :rate_limit | :unknown
+  @spec classify_error(term()) :: :turn_timeout | :sentinel_missing | :nonce_mismatch | :auth_revoked | :rate_limit | :unknown
   def classify_error(:turn_timeout), do: :turn_timeout
   def classify_error(:sentinel_missing), do: :sentinel_missing
   def classify_error({:nonce_mismatch, _out}), do: :nonce_mismatch
@@ -184,19 +190,22 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
       |> String.split("\n")
       |> Enum.take(-50)
       |> Enum.join("\n")
+      |> String.downcase()
 
     cond do
-      String.contains?(tail, "Not logged in") or
-          String.contains?(tail, "auth_required") or
-          String.contains?(tail, "TokenRefreshFailed") or
-          String.contains?(tail, "invalid_grant") or
-          String.contains?(tail, "HTTP 401") ->
+      String.contains?(tail, "not logged in") or
+        String.contains?(tail, "auth_required") or
+        String.contains?(tail, "tokenrefreshfailed") or
+        String.contains?(tail, "invalid_grant") or
+        String.contains?(tail, "401") or
+          String.contains?(tail, "credentials") ->
         :auth_revoked
 
-      String.contains?(tail, "Rate limit exceeded") or
-          String.contains?(tail, "Too Many Requests") or
-          String.contains?(tail, "rate_limit_exceeded") or
-          String.contains?(tail, "HTTP 429") ->
+      String.contains?(tail, "rate limit") or
+        String.contains?(tail, "too many requests") or
+        String.contains?(tail, "rate_limit_exceeded") or
+        String.contains?(tail, "429") or
+          String.contains?(tail, "quota") ->
         :rate_limit
 
       String.contains?(tail, "timeout") or
@@ -212,7 +221,9 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   # fail_turn so the issue exits turn_running. Retry budget is consumed, but the
   # admission gate (begin/3) prevents new turns while the realm is blocked —
   # meaning budget is only burned once per realm-unblock cycle.
-  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :auth_revoked) do
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason, details \\ nil)
+
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :auth_revoked, details) do
     :ok = AuthRealms.block(AuthRealms.default_realm())
 
     {:ok, _} =
@@ -220,11 +231,12 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         attempt_id: attempt_id,
         turn_id: turn_id,
         chain: chain,
-        reason: :auth_revoked
+        reason: :auth_revoked,
+        details: details
       })
   end
 
-  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :rate_limit) do
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :rate_limit, details) do
     retry_at = System.system_time(:second) + 3600
     :ok = AuthRealms.throttle(AuthRealms.default_realm(), retry_at)
 
@@ -233,17 +245,19 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         attempt_id: attempt_id,
         turn_id: turn_id,
         chain: chain,
-        reason: :rate_limit
+        reason: :rate_limit,
+        details: details
       })
   end
 
-  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason) do
+  defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason, details) do
     {:ok, _} =
       Issues.fail_turn(issue_key, %{
         attempt_id: attempt_id,
         turn_id: turn_id,
         chain: chain,
-        reason: reason
+        reason: reason,
+        details: details
       })
   end
 
@@ -290,7 +304,9 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     opts = Keyword.fetch!(ctx, :opts)
     state_required? = Keyword.fetch!(ctx, :state_required?)
 
-    case Cmux.run_turn(chain,
+    cmux_module = Map.get(session, :cmux_module, Cmux)
+
+    case cmux_module.run_turn(chain,
            workspace: workspace,
            turn_id: turn_id,
            attempt_id: attempt_id,
@@ -305,28 +321,51 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         summary = StreamJsonParser.summarize(events)
         new_sid = summary[:session_id] || session.session_id
 
-        if state_required? and not is_nil(issue_key) do
-          :ok =
-            Issues.complete_turn(issue_key, %{
-              attempt_id: attempt_id,
-              turn_id: turn_id,
-              chain: chain,
-              session_id: new_sid,
-              summary: summary
-            })
+        verification_context = %{
+          issue_id: issue_key,
+          chain: chain,
+          workspace: workspace,
+          backend: "claude_cmux_print",
+          summary: summary
+        }
 
-          :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        case Verification.verify_turn(verification_context) do
+          {:ok, verification} ->
+            summary = summary |> Map.put(:verification, verification) |> Map.put(:session_id, new_sid)
+
+            if state_required? and not is_nil(issue_key) do
+              :ok =
+                Issues.complete_turn(issue_key, %{
+                  attempt_id: attempt_id,
+                  turn_id: turn_id,
+                  chain: chain,
+                  session_id: new_sid,
+                  summary: summary
+                })
+
+              :ok = Mutate.post_turn_comment(issue_key, chain, summary)
+            end
+
+            new_session = %{session | session_id: new_sid}
+            {:ok, summary, new_session}
+
+          {:error, verification} ->
+            Logger.warning("[claude_cmux] verifier failed reason=#{verification.reason} chain=#{chain}")
+
+            if state_required? and not is_nil(issue_key) do
+              handle_turn_failure(issue_key, turn_id, attempt_id, chain, Verification.failure_reason(verification), %{
+                verification: verification,
+                summary: summary
+              })
+            end
+
+            {:error, {:verification_failed, verification}}
         end
-
-        new_session = %{session | session_id: new_sid}
-        {:ok, Map.put(summary, :session_id, new_sid), new_session}
 
       {:error, reason} ->
         classified = classify_error(reason)
 
-        Logger.warning(
-          "[claude_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}"
-        )
+        Logger.warning("[claude_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}")
 
         if state_required? and not is_nil(issue_key) do
           handle_turn_failure(issue_key, turn_id, attempt_id, chain, classified)

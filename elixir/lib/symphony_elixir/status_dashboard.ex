@@ -393,16 +393,8 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_project_link_lines do
-    project_part =
-      case Config.settings!().tracker.project_slug do
-        project_slug when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
-
-        _ ->
-          colorize("n/a", @ansi_gray)
-      end
-
-    project_line = colorize("│ Project: ", @ansi_bold) <> project_part
+    {scope_label, scope_part} = tracker_scope_display(Config.settings!().tracker)
+    project_line = colorize("│ #{scope_label}: ", @ansi_bold) <> scope_part
 
     case dashboard_url() do
       url when is_binary(url) ->
@@ -428,6 +420,22 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
+
+  defp tracker_scope_display(tracker) do
+    cond do
+      present_string?(tracker.project_slug) ->
+        {"Project", colorize(linear_project_url(String.trim(tracker.project_slug)), @ansi_cyan)}
+
+      present_string?(tracker.team_key) ->
+        {"Team", colorize(String.trim(tracker.team_key), @ansi_cyan)}
+
+      true ->
+        {"Tracker", colorize("n/a", @ansi_gray)}
+    end
+  end
+
+  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present_string?(_value), do: false
 
   defp dashboard_url do
     dashboard_url(Config.settings!().server.host, Config.server_port(), HttpServer.bound_port())
