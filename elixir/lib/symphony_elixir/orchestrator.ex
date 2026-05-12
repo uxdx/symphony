@@ -815,40 +815,39 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.warning("Retry cap reached for issue_id=#{issue_id} issue_identifier=#{identifier} after #{next_attempt} attempts; releasing claim")
       release_issue_claim(state, issue_id)
     else
+      delay_ms = retry_delay(next_attempt, metadata)
+      old_timer = Map.get(previous_retry, :timer_ref)
+      retry_token = make_ref()
+      due_at_ms = System.monotonic_time(:millisecond) + delay_ms
+      identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
+      error = pick_retry_error(previous_retry, metadata)
+      worker_host = pick_retry_worker_host(previous_retry, metadata)
+      workspace_path = pick_retry_workspace_path(previous_retry, metadata)
 
-    delay_ms = retry_delay(next_attempt, metadata)
-    old_timer = Map.get(previous_retry, :timer_ref)
-    retry_token = make_ref()
-    due_at_ms = System.monotonic_time(:millisecond) + delay_ms
-    identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
-    error = pick_retry_error(previous_retry, metadata)
-    worker_host = pick_retry_worker_host(previous_retry, metadata)
-    workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+      if is_reference(old_timer) do
+        Process.cancel_timer(old_timer)
+      end
 
-    if is_reference(old_timer) do
-      Process.cancel_timer(old_timer)
-    end
+      timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
 
-    timer_ref = Process.send_after(self(), {:retry_issue, issue_id, retry_token}, delay_ms)
+      error_suffix = if is_binary(error), do: " error=#{error}", else: ""
 
-    error_suffix = if is_binary(error), do: " error=#{error}", else: ""
+      Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
 
-    Logger.warning("Retrying issue_id=#{issue_id} issue_identifier=#{identifier} in #{delay_ms}ms (attempt #{next_attempt})#{error_suffix}")
-
-    %{
-      state
-      | retry_attempts:
-          Map.put(state.retry_attempts, issue_id, %{
-            attempt: next_attempt,
-            timer_ref: timer_ref,
-            retry_token: retry_token,
-            due_at_ms: due_at_ms,
-            identifier: identifier,
-            error: error,
-            worker_host: worker_host,
-            workspace_path: workspace_path
-          })
-    }
+      %{
+        state
+        | retry_attempts:
+            Map.put(state.retry_attempts, issue_id, %{
+              attempt: next_attempt,
+              timer_ref: timer_ref,
+              retry_token: retry_token,
+              due_at_ms: due_at_ms,
+              identifier: identifier,
+              error: error,
+              worker_host: worker_host,
+              workspace_path: workspace_path
+            })
+      }
     end
   end
 

@@ -82,6 +82,7 @@ defmodule SymphonyElixir.Agent.StreamJsonParserTest do
 
     test "default summary on empty events" do
       summary = StreamJsonParser.summarize([])
+
       assert summary == %{
                session_id: nil,
                success: false,

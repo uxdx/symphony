@@ -80,10 +80,15 @@ defmodule SymphonyElixir.Agent.StreamJsonParser do
 
   defp read_usage(ev, key) do
     cond do
-      is_map(ev["usage"]) and is_integer(ev["usage"][key]) -> ev["usage"][key]
+      is_map(ev["usage"]) and is_integer(ev["usage"][key]) ->
+        ev["usage"][key]
+
       is_map(ev["message"]) and is_map(ev["message"]["usage"]) and
-          is_integer(ev["message"]["usage"][key]) -> ev["message"]["usage"][key]
-      true -> 0
+          is_integer(ev["message"]["usage"][key]) ->
+        ev["message"]["usage"][key]
+
+      true ->
+        0
     end
   end
 

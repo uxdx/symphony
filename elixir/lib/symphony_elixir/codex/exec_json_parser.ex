@@ -59,12 +59,7 @@ defmodule SymphonyElixir.Codex.ExecJsonParser do
   end
 
   defp fold_event(%{"type" => "turn.completed", "usage" => usage}, acc) when is_map(usage) do
-    %{acc |
-      success: true,
-      stop_reason: "completed",
-      tokens_in: Map.get(usage, "input_tokens", 0),
-      tokens_out: Map.get(usage, "output_tokens", 0)
-    }
+    %{acc | success: true, stop_reason: "completed", tokens_in: Map.get(usage, "input_tokens", 0), tokens_out: Map.get(usage, "output_tokens", 0)}
   end
 
   defp fold_event(%{"type" => "turn.completed"}, acc) do

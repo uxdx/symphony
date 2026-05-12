@@ -94,21 +94,12 @@ defmodule Mix.Tasks.Ops.Check do
   end
 
   defp validate_ops_workflow(errors, "enabled", workflow_path) do
-    case Workflow.load(Path.expand(workflow_path)) do
-      {:ok, %{config: config}} ->
-        case Schema.parse(config) do
-          {:ok, settings} ->
-            required_labels = settings.tracker.required_labels || []
-
-            if @ops_label in required_labels do
-              errors
-            else
-              ["symphony-ops workflow must require label #{@ops_label}" | errors]
-            end
-
-          {:error, reason} ->
-            ["invalid symphony-ops workflow config: #{inspect(reason)}" | errors]
-        end
+    with {:ok, %{config: config}} <- Workflow.load(Path.expand(workflow_path)),
+         {:ok, settings} <- Schema.parse(config) do
+      validate_ops_label(errors, settings)
+    else
+      {:error, {:invalid_workflow_config, _message} = reason} ->
+        ["invalid symphony-ops workflow config: #{inspect(reason)}" | errors]
 
       {:error, reason} ->
         ["failed to load symphony-ops workflow: #{inspect(reason)}" | errors]
@@ -116,6 +107,16 @@ defmodule Mix.Tasks.Ops.Check do
   end
 
   defp validate_ops_workflow(errors, _decision, _workflow_path), do: errors
+
+  defp validate_ops_label(errors, settings) do
+    required_labels = settings.tracker.required_labels || []
+
+    if @ops_label in required_labels do
+      errors
+    else
+      ["symphony-ops workflow must require label #{@ops_label}" | errors]
+    end
+  end
 
   defp validate_apply_ack(errors, "apply", @apply_ack), do: errors
 

@@ -19,15 +19,16 @@ defmodule SymphonyElixir.State.AuthRealms do
     block_count 3+ → 240 min (cap)
   """
 
-  alias SymphonyElixir.State
   alias Exqlite.Sqlite3
+  alias SymphonyElixir.State
 
   require Logger
 
   @default_realm "claude:default"
-  @block_backoff_sec [1800, 3600, 7200, 14400]
+  @block_backoff_sec [1800, 3600, 7200, 14_400]
 
   @doc "The realm id used for all claude-backed chains."
+  @spec default_realm() :: String.t()
   def default_realm, do: @default_realm
 
   @doc """
@@ -39,6 +40,7 @@ defmodule SymphonyElixir.State.AuthRealms do
     {:throttled, throttled_until_sec}— rate-limited until that unix timestamp
   """
   @spec check(String.t()) :: :ok | {:blocked, integer()} | {:throttled, integer()}
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def check(realm_id) do
     now = System.system_time(:second)
 
@@ -73,6 +75,7 @@ defmodule SymphonyElixir.State.AuthRealms do
   the same epoch: a second concurrent failure does not extend the TTL).
   """
   @spec block(String.t()) :: :ok
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def block(realm_id) do
     now = System.system_time(:second)
 
@@ -84,15 +87,13 @@ defmodule SymphonyElixir.State.AuthRealms do
           # Already blocked in this epoch — idempotent.
           :ok
         else
-          block_count = (realm && realm.block_count || 0)
+          block_count = (realm && realm.block_count) || 0
           new_count = block_count + 1
           backoff = Enum.at(@block_backoff_sec, min(block_count, length(@block_backoff_sec) - 1))
           blocked_until = now + backoff
-          epoch = (realm && realm.epoch || 0) + 1
+          epoch = ((realm && realm.epoch) || 0) + 1
 
-          Logger.warning(
-            "[auth_realms] blocking realm=#{realm_id} epoch=#{epoch} block_count=#{new_count} blocked_until=#{blocked_until} (#{div(backoff, 60)}m)"
-          )
+          Logger.warning("[auth_realms] blocking realm=#{realm_id} epoch=#{epoch} block_count=#{new_count} blocked_until=#{blocked_until} (#{div(backoff, 60)}m)")
 
           upsert_realm!(conn, %{
             realm_id: realm_id,
@@ -101,7 +102,7 @@ defmodule SymphonyElixir.State.AuthRealms do
             blocked_until: blocked_until,
             block_count: new_count,
             throttled_until: realm && realm.throttled_until,
-            throttle_count: realm && realm.throttle_count || 0,
+            throttle_count: (realm && realm.throttle_count) || 0,
             updated_at: now
           })
         end
@@ -115,26 +116,25 @@ defmodule SymphonyElixir.State.AuthRealms do
   `retry_at` is a unix timestamp in seconds.
   """
   @spec throttle(String.t(), integer()) :: :ok
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def throttle(realm_id, retry_at) when is_integer(retry_at) do
     now = System.system_time(:second)
 
     {:ok, _} =
       State.transaction(fn conn ->
         realm = fetch_realm(conn, realm_id)
-        prev_until = realm && realm.throttled_until || 0
+        prev_until = (realm && realm.throttled_until) || 0
         new_until = max(prev_until, retry_at)
-        count = (realm && realm.throttle_count || 0) + 1
+        count = ((realm && realm.throttle_count) || 0) + 1
 
-        Logger.warning(
-          "[auth_realms] throttling realm=#{realm_id} throttled_until=#{new_until} throttle_count=#{count}"
-        )
+        Logger.warning("[auth_realms] throttling realm=#{realm_id} throttled_until=#{new_until} throttle_count=#{count}")
 
         upsert_realm!(conn, %{
           realm_id: realm_id,
-          status: realm && realm.status || "healthy",
-          epoch: realm && realm.epoch || 0,
+          status: (realm && realm.status) || "healthy",
+          epoch: (realm && realm.epoch) || 0,
           blocked_until: realm && realm.blocked_until,
-          block_count: realm && realm.block_count || 0,
+          block_count: (realm && realm.block_count) || 0,
           throttled_until: new_until,
           throttle_count: count,
           updated_at: now
@@ -187,11 +187,11 @@ defmodule SymphonyElixir.State.AuthRealms do
         upsert_realm!(conn, %{
           realm_id: realm_id,
           status: "healthy",
-          epoch: realm && realm.epoch || 0,
+          epoch: (realm && realm.epoch) || 0,
           blocked_until: nil,
-          block_count: realm && realm.block_count || 0,
+          block_count: (realm && realm.block_count) || 0,
           throttled_until: realm && realm.throttled_until,
-          throttle_count: realm && realm.throttle_count || 0,
+          throttle_count: (realm && realm.throttle_count) || 0,
           updated_at: now
         })
       end)
@@ -229,21 +229,31 @@ defmodule SymphonyElixir.State.AuthRealms do
   end
 
   defp upsert_realm!(conn, m) do
-    exec!(conn, """
-    INSERT INTO auth_realms(realm_id, status, epoch, blocked_until, block_count, throttled_until, throttle_count, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(realm_id) DO UPDATE SET
-      status          = excluded.status,
-      epoch           = excluded.epoch,
-      blocked_until   = excluded.blocked_until,
-      block_count     = excluded.block_count,
-      throttled_until = excluded.throttled_until,
-      throttle_count  = excluded.throttle_count,
-      updated_at      = excluded.updated_at
-    """, [
-      m.realm_id, m.status, m.epoch, m.blocked_until, m.block_count,
-      m.throttled_until, m.throttle_count, m.updated_at
-    ])
+    exec!(
+      conn,
+      """
+      INSERT INTO auth_realms(realm_id, status, epoch, blocked_until, block_count, throttled_until, throttle_count, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(realm_id) DO UPDATE SET
+        status          = excluded.status,
+        epoch           = excluded.epoch,
+        blocked_until   = excluded.blocked_until,
+        block_count     = excluded.block_count,
+        throttled_until = excluded.throttled_until,
+        throttle_count  = excluded.throttle_count,
+        updated_at      = excluded.updated_at
+      """,
+      [
+        m.realm_id,
+        m.status,
+        m.epoch,
+        m.blocked_until,
+        m.block_count,
+        m.throttled_until,
+        m.throttle_count,
+        m.updated_at
+      ]
+    )
   end
 
   defp exec!(conn, sql, params) do

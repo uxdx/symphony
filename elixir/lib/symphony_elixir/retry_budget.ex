@@ -12,7 +12,7 @@ defmodule SymphonyElixir.RetryBudget do
   """
 
   @schedule_default [60, 300, 900, 3_600, 14_400]
-  @schedule_auth   [60, 300, 900]
+  @schedule_auth [60, 300, 900]
 
   @type reason :: atom()
   @type opts :: [

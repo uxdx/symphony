@@ -427,7 +427,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert {:ok, []} = Client.fetch_issues_by_states_for_test(["Todo"], graphql_fun)
 
-    assert_receive {:linear_poll_query, query, %{teamKey: "AGT1", stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil}}
+    assert_receive {
+      :linear_poll_query,
+      query,
+      %{teamKey: "AGT1", stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil}
+    }
 
     assert query =~ "SymphonyLinearPollByTeam"
     assert query =~ "team: {key: {eq: $teamKey}}"

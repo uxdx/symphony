@@ -18,8 +18,8 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   @behaviour SymphonyElixir.Agent.Backend
 
   alias SymphonyElixir.Cmux
-  alias SymphonyElixir.Config
   alias SymphonyElixir.Codex.ExecJsonParser
+  alias SymphonyElixir.Config
   alias SymphonyElixir.Linear.Mutate
   alias SymphonyElixir.State.{AuthRealms, Issues}
   alias SymphonyElixir.Verification
@@ -86,9 +86,8 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
 
   @impl true
   def stop_session(%{chain: chain} = session) do
-    session
-    |> Map.get(:cmux_module, Cmux)
-    |> apply(:close_lane, [chain])
+    cmux_module = Map.get(session, :cmux_module, Cmux)
+    cmux_module.close_lane(chain)
   end
 
   @doc false
@@ -177,6 +176,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
     end
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp do_run_turn(session, issue_key, turn_id, attempt_id, cmd_body, ctx) do
     chain = Keyword.fetch!(ctx, :chain)
     workspace = Keyword.fetch!(ctx, :workspace)
@@ -209,22 +209,12 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
           summary: summary
         }
 
+        # credo:disable-for-next-line Credo.Check.Refactor.Nesting
         case Verification.verify_turn(verification_context) do
           {:ok, verification} ->
             summary = summary |> Map.put(:verification, verification) |> Map.put(:session_id, new_sid)
 
-            if state_required? and not is_nil(issue_key) do
-              :ok =
-                Issues.complete_turn(issue_key, %{
-                  attempt_id: attempt_id,
-                  turn_id: turn_id,
-                  chain: chain,
-                  session_id: new_sid,
-                  summary: summary
-                })
-
-              :ok = Mutate.post_turn_comment(issue_key, chain, summary)
-            end
+            :ok = maybe_complete_turn(state_required?, issue_key, attempt_id, turn_id, chain, new_sid, summary)
 
             new_session = %{session | session_id: new_sid}
             {:ok, summary, new_session}
@@ -232,12 +222,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
           {:error, verification} ->
             Logger.warning("[codex_cmux] verifier failed reason=#{verification.reason} chain=#{chain}")
 
-            if state_required? and not is_nil(issue_key) do
-              handle_turn_failure(issue_key, turn_id, attempt_id, chain, Verification.failure_reason(verification), %{
-                verification: verification,
-                summary: summary
-              })
-            end
+            :ok = maybe_fail_turn(state_required?, issue_key, turn_id, attempt_id, chain, verification, summary)
 
             {:error, {:verification_failed, verification}}
         end
@@ -247,13 +232,47 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
 
         Logger.warning("[codex_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}")
 
-        if state_required? and not is_nil(issue_key) do
-          handle_turn_failure(issue_key, turn_id, attempt_id, chain, classified)
-        end
+        :ok = maybe_handle_turn_failure(state_required?, issue_key, turn_id, attempt_id, chain, classified)
 
         {:error, classified}
     end
   end
+
+  defp maybe_complete_turn(true, issue_key, attempt_id, turn_id, chain, session_id, summary)
+       when not is_nil(issue_key) do
+    :ok =
+      Issues.complete_turn(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        session_id: session_id,
+        summary: summary
+      })
+
+    Mutate.post_turn_comment(issue_key, chain, summary)
+  end
+
+  defp maybe_complete_turn(_state_required?, _issue_key, _attempt_id, _turn_id, _chain, _session_id, _summary),
+    do: :ok
+
+  defp maybe_fail_turn(true, issue_key, turn_id, attempt_id, chain, verification, summary)
+       when not is_nil(issue_key) do
+    handle_turn_failure(issue_key, turn_id, attempt_id, chain, Verification.failure_reason(verification), %{
+      verification: verification,
+      summary: summary
+    })
+  end
+
+  defp maybe_fail_turn(_state_required?, _issue_key, _turn_id, _attempt_id, _chain, _verification, _summary),
+    do: :ok
+
+  defp maybe_handle_turn_failure(true, issue_key, turn_id, attempt_id, chain, reason)
+       when not is_nil(issue_key) do
+    handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason)
+  end
+
+  defp maybe_handle_turn_failure(_state_required?, _issue_key, _turn_id, _attempt_id, _chain, _reason),
+    do: :ok
 
   defp classify_error(:turn_timeout), do: :turn_timeout
   defp classify_error(:sentinel_missing), do: :sentinel_missing
@@ -261,6 +280,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   defp classify_error({:turn_failed, _code, out}) when is_binary(out), do: classify_stdout(out)
   defp classify_error(_), do: :unknown
 
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp classify_stdout(out) do
     # Scan only the last 50 lines to avoid false positives from prompt content
     # or bash terminal echoes that may contain user issue text.
@@ -309,6 +329,8 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         reason: :auth_revoked,
         details: details
       })
+
+    :ok
   end
 
   defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, :rate_limit, details) do
@@ -323,6 +345,8 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         reason: :rate_limit,
         details: details
       })
+
+    :ok
   end
 
   defp handle_turn_failure(issue_key, turn_id, attempt_id, chain, reason, details) do
@@ -334,6 +358,8 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         reason: reason,
         details: details
       })
+
+    :ok
   end
 
   defp issue_key(%{identifier: id}) when is_binary(id) and id != "", do: id

@@ -153,15 +153,13 @@ defmodule SymphonyElixir.Linear.Client do
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
 
-    cond do
-      is_nil(tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      true ->
-        with {:ok, scope} <- tracker_scope(tracker),
-             {:ok, assignee_filter} <- routing_assignee_filter(tracker) do
-          do_fetch_by_states(scope, tracker.active_states, routing_filter(assignee_filter, tracker))
-        end
+    if is_nil(tracker.api_key) do
+      {:error, :missing_linear_api_token}
+    else
+      with {:ok, scope} <- tracker_scope(tracker),
+           {:ok, assignee_filter} <- routing_assignee_filter(tracker) do
+        do_fetch_by_states(scope, tracker.active_states, routing_filter(assignee_filter, tracker))
+      end
     end
   end
 
@@ -172,16 +170,18 @@ defmodule SymphonyElixir.Linear.Client do
     if normalized_states == [] do
       {:ok, []}
     else
-      tracker = Config.settings!().tracker
+      fetch_nonempty_issues_by_states(normalized_states)
+    end
+  end
 
-      cond do
-        is_nil(tracker.api_key) ->
-          {:error, :missing_linear_api_token}
+  defp fetch_nonempty_issues_by_states(normalized_states) do
+    tracker = Config.settings!().tracker
 
-        true ->
-          with {:ok, scope} <- tracker_scope(tracker) do
-            do_fetch_by_states(scope, normalized_states, routing_filter(nil, tracker))
-          end
+    if is_nil(tracker.api_key) do
+      {:error, :missing_linear_api_token}
+    else
+      with {:ok, scope} <- tracker_scope(tracker) do
+        do_fetch_by_states(scope, normalized_states, routing_filter(nil, tracker))
       end
     end
   end
@@ -541,7 +541,9 @@ defmodule SymphonyElixir.Linear.Client do
       assignee_id: assignee_field(assignee, "id"),
       blocked_by: extract_blockers(issue),
       labels: labels,
-      assigned_to_worker: assigned_to_worker?(assignee, routing_filter.assignee_filter) and labels_routable?(labels, routing_filter),
+      assigned_to_worker:
+        assigned_to_worker?(assignee, routing_filter.assignee_filter) and
+          labels_routable?(labels, routing_filter),
       created_at: parse_datetime(issue["createdAt"]),
       updated_at: parse_datetime(issue["updatedAt"])
     }

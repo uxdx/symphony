@@ -200,11 +200,8 @@ defmodule SymphonyElixir.State do
   defp insert_boot_run!(conn) do
     pid_int = String.to_integer(System.pid())
 
-    hostname =
-      case :inet.gethostname() do
-        {:ok, h} -> List.to_string(h)
-        _ -> "unknown"
-      end
+    {:ok, hostname_chars} = :inet.gethostname()
+    hostname = List.to_string(hostname_chars)
 
     started_at = System.system_time(:second)
 

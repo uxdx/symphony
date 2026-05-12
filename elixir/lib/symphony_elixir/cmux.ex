@@ -58,22 +58,26 @@ defmodule SymphonyElixir.Cmux do
     cmd_file = write_temp_cmd(turn_id, cmd_body)
 
     try do
-      case System.cmd(sazo_slave_bin(), [
-             "run-turn",
-             "symphony-#{lane}",
-             "--workspace",
-             workspace,
-             "--lane",
-             lane,
-             "--turn-id",
-             turn_id,
-             "--attempt-id",
-             to_string(attempt_id),
-             "--cmd-file",
-             cmd_file,
-             "--timeout",
-             to_string(timeout)
-           ], stderr_to_stdout: true) do
+      case System.cmd(
+             sazo_slave_bin(),
+             [
+               "run-turn",
+               "symphony-#{lane}",
+               "--workspace",
+               workspace,
+               "--lane",
+               lane,
+               "--turn-id",
+               turn_id,
+               "--attempt-id",
+               to_string(attempt_id),
+               "--cmd-file",
+               cmd_file,
+               "--timeout",
+               to_string(timeout)
+             ],
+             stderr_to_stdout: true
+           ) do
         {out, 0} -> {:ok, out}
         {_, 124} -> {:error, :turn_timeout}
         {_, 125} -> {:error, :sentinel_missing}
@@ -89,9 +93,7 @@ defmodule SymphonyElixir.Cmux do
   @spec close_lane(lane_name()) :: :ok
   def close_lane(lane) do
     {_out, _code} =
-      System.cmd(sazo_slave_bin(), ["close", "symphony-#{lane}"],
-        stderr_to_stdout: true
-      )
+      System.cmd(sazo_slave_bin(), ["close", "symphony-#{lane}"], stderr_to_stdout: true)
 
     :ok
   end
@@ -121,6 +123,7 @@ defmodule SymphonyElixir.Cmux do
   end
 
   @doc false
+  @spec parse_lane(lane_name(), String.t()) :: {:ok, lane_info()}
   def parse_lane(lane, out) do
     surface =
       case Regex.run(~r/surface=(surface:\d+|[A-F0-9-]{36})/i, out) do

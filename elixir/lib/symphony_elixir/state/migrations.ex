@@ -123,12 +123,13 @@ defmodule SymphonyElixir.State.Migrations do
   @doc "Apply all pending migrations idempotently."
   @spec migrate(reference()) :: :ok
   def migrate(conn) do
-    :ok = Sqlite3.execute(conn, """
-    CREATE TABLE IF NOT EXISTS schema_version (
-      version    INTEGER PRIMARY KEY,
-      applied_at INTEGER NOT NULL
-    )
-    """)
+    :ok =
+      Sqlite3.execute(conn, """
+      CREATE TABLE IF NOT EXISTS schema_version (
+        version    INTEGER PRIMARY KEY,
+        applied_at INTEGER NOT NULL
+      )
+      """)
 
     @migrations
     |> Map.keys()

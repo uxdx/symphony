@@ -99,6 +99,7 @@ defmodule SymphonyElixir.Config do
   end
 
   @spec format_error(term()) :: String.t()
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def format_error(reason) do
     case reason do
       {:invalid_workflow_config, message} ->
