@@ -55,7 +55,7 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
-  @query_by_team """
+  @query_by_team_key """
   query SymphonyLinearPollByTeam($teamKey: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
     issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
       nodes {
@@ -149,6 +149,21 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @comments_query """
+  query SymphonyLinearIssueComments($id: String!, $first: Int!) {
+    issue(id: $id) {
+      comments(first: $first) {
+        nodes {
+          id
+          body
+          createdAt
+          updatedAt
+        }
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
@@ -200,6 +215,23 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter(tracker) do
           do_fetch_issue_states(ids, routing_filter(assignee_filter, tracker))
         end
+    end
+  end
+
+  @spec fetch_issue_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    case graphql(@comments_query, %{id: issue_id, first: @issue_page_size}) do
+      {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}} when is_list(nodes) ->
+        {:ok, nodes}
+
+      {:ok, %{"errors" => errors}} ->
+        {:error, {:linear_graphql_errors, errors}}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :linear_unknown_payload}
     end
   end
 
@@ -377,7 +409,7 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp build_poll_query({:team, team_key}, state_names, after_cursor) do
-    {@query_by_team,
+    {@query_by_team_key,
      %{
        teamKey: team_key,
        stateNames: state_names,

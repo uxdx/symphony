@@ -27,8 +27,11 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.Codex.ExecJsonParser,
           SymphonyElixir.Cmux,
           SymphonyElixir.Claude.CmuxPrintBackend,
+          SymphonyElixir.Config.Compiler,
           SymphonyElixir.Config.Schema,
+          SymphonyElixir.Config.Schema.Claude,
           SymphonyElixir.HttpServer,
+          SymphonyElixir.Linear.Adapter,
           SymphonyElixir.Linear.Mutate,
           SymphonyElixir.RetryBudget,
           SymphonyElixir.State,
@@ -37,11 +40,17 @@ defmodule SymphonyElixir.MixProject do
           SymphonyElixir.State.Issues.StaleStateError,
           SymphonyElixir.State.Migrations,
           SymphonyElixir.StatusDashboard,
+          SymphonyElixir.Tracker,
+          SymphonyElixir.Tracker.Memory,
           SymphonyElixir.Verification,
+          SymphonyElixir.Verification.Generic,
+          SymphonyElixir.Verification.Noop,
+          SymphonyElixir.Verification.TodoCode,
           SymphonyElixir.LogFile,
           Mix.Tasks.Launchd.Check,
           Mix.Tasks.Ops.Check,
           Mix.Tasks.Release.Check,
+          Mix.Tasks.Symphony.Workflow.Preflight,
           Mix.Tasks.Workflow.Check,
           SymphonyElixir.Workspace,
           SymphonyElixirWeb.DashboardLive,
@@ -76,9 +85,22 @@ defmodule SymphonyElixir.MixProject do
       symphony: [
         applications: [symphony_elixir: :permanent],
         include_executables_for: [:unix],
-        steps: [:assemble]
+        steps: [:assemble, &write_release_commit/1]
       ]
     ]
+  end
+
+  defp write_release_commit(%Mix.Release{} = release) do
+    commit = System.get_env("SYMPHONY_RELEASE_COMMIT") || git_head() || "unknown"
+    File.write!(Path.join(release.path, "RELEASE_COMMIT"), commit <> "\n")
+    release
+  end
+
+  defp git_head do
+    case System.cmd("git", ["rev-parse", "HEAD"], stderr_to_stdout: true) do
+      {commit, 0} -> String.trim(commit)
+      _ -> nil
+    end
   end
 
   # Run "mix help compile.app" to learn about applications.

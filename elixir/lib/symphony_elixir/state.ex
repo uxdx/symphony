@@ -21,6 +21,7 @@ defmodule SymphonyElixir.State do
   use GenServer
 
   alias Exqlite.Sqlite3
+  alias SymphonyElixir.State.Issues
   alias SymphonyElixir.State.Migrations
 
   require Logger
@@ -151,6 +152,7 @@ defmodule SymphonyElixir.State do
   @impl true
   def init(opts) do
     db_path = Keyword.get(opts, :db_path, default_db_path())
+    ensure_db_path_outside_current_git_checkout!(db_path)
     File.mkdir_p!(Path.dirname(db_path))
     {:ok, conn} = Sqlite3.open(db_path)
     :ok = Sqlite3.execute(conn, "PRAGMA journal_mode = WAL")
@@ -160,13 +162,9 @@ defmodule SymphonyElixir.State do
 
     boot = insert_boot_run!(conn)
     :persistent_term.put({__MODULE__, :boot_run_id}, boot.boot_run_id)
-    stale = reconcile_stale_turn_running!(conn, boot.boot_run_id, "boot")
+    {:ok, stale_reconcile} = Issues.reconcile_stale_turn_running_on_boot(conn, boot_run_id: boot.boot_run_id)
 
-    Logger.info("[symphony-state] db=#{db_path} boot_run_id=#{boot.boot_run_id} pid=#{boot.pid}")
-
-    if stale.count > 0 do
-      Logger.warning("[symphony-state] reconciled #{stale.count} stale turn_running row(s)")
-    end
+    Logger.info("[symphony-state] db=#{db_path} boot_run_id=#{boot.boot_run_id} pid=#{boot.pid} stale_turn_running_reconciled=#{length(stale_reconcile.reconciled)}")
 
     {:ok, %{conn: conn, db_path: db_path, boot: boot}}
   end
@@ -196,6 +194,32 @@ defmodule SymphonyElixir.State do
   end
 
   ## Internals
+
+  defp ensure_db_path_outside_current_git_checkout!(db_path) do
+    with {:ok, cwd} <- File.cwd(),
+         {root, 0} <- System.cmd("git", ["-C", cwd, "rev-parse", "--show-toplevel"], stderr_to_stdout: true) do
+      root = root |> String.trim() |> normalize_path()
+      expanded_db_path = normalize_path(db_path)
+
+      if inside_path?(expanded_db_path, root) do
+        raise ArgumentError,
+              "Symphony state DB path must not be inside the repository checkout: #{expanded_db_path}"
+      end
+    else
+      _ -> :ok
+    end
+  end
+
+  defp inside_path?(path, root) do
+    path == root or String.starts_with?(path, root <> "/")
+  end
+
+  defp normalize_path(path) do
+    path
+    |> Path.expand()
+    |> String.replace_prefix("/private/var/", "/var/")
+    |> String.replace_prefix("/private/tmp/", "/tmp/")
+  end
 
   defp insert_boot_run!(conn) do
     pid_int = String.to_integer(System.pid())

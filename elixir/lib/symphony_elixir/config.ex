@@ -3,6 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
+  alias SymphonyElixir.Config.Compiler
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Workflow
 
@@ -98,6 +99,25 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec preflight_file(Path.t()) :: :ok | {:error, String.t()}
+  def preflight_file(path), do: Compiler.preflight_file(path)
+
+  @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
+          {:ok, codex_runtime_settings()} | {:error, term()}
+  def codex_runtime_settings(workspace \\ nil, opts \\ []) do
+    with {:ok, settings} <- settings() do
+      with {:ok, turn_sandbox_policy} <-
+             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+        {:ok,
+         %{
+           approval_policy: settings.codex.approval_policy,
+           thread_sandbox: settings.codex.thread_sandbox,
+           turn_sandbox_policy: turn_sandbox_policy
+         }}
+      end
+    end
+  end
+
   @spec format_error(term()) :: String.t()
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def format_error(reason) do
@@ -126,27 +146,11 @@ defmodule SymphonyElixir.Config do
       :missing_linear_tracker_scope ->
         "Linear tracker scope missing; set tracker.project_slug or tracker.team_key"
 
-      :missing_linear_project_slug ->
-        "Linear tracker scope missing; set tracker.project_slug or tracker.team_key"
+      :missing_linear_project_slug_or_team_key ->
+        "Linear tracker scope missing; set tracker.project_slug or tracker.team_key (exactly one)"
 
       other ->
         "Invalid WORKFLOW.md config: #{inspect(other)}"
-    end
-  end
-
-  @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
-          {:ok, codex_runtime_settings()} | {:error, term()}
-  def codex_runtime_settings(workspace \\ nil, opts \\ []) do
-    with {:ok, settings} <- settings() do
-      with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
-        {:ok,
-         %{
-           approval_policy: settings.codex.approval_policy,
-           thread_sandbox: settings.codex.thread_sandbox,
-           turn_sandbox_policy: turn_sandbox_policy
-         }}
-      end
     end
   end
 
@@ -161,16 +165,17 @@ defmodule SymphonyElixir.Config do
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
-      settings.tracker.kind == "linear" and not has_linear_tracker_scope?(settings.tracker) ->
-        {:error, :missing_linear_tracker_scope}
+      settings.tracker.kind == "linear" and locator_count(settings.tracker) != 1 ->
+        {:error, :missing_linear_project_slug_or_team_key}
 
       true ->
         :ok
     end
   end
 
-  defp has_linear_tracker_scope?(tracker) do
-    present_string?(tracker.project_slug) or present_string?(tracker.team_key)
+  defp locator_count(tracker) do
+    [tracker.project_slug, tracker.team_key]
+    |> Enum.count(&present_string?/1)
   end
 
   defp present_string?(value) when is_binary(value), do: String.trim(value) != ""

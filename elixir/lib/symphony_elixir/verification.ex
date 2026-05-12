@@ -1,102 +1,38 @@
 defmodule SymphonyElixir.Verification do
   @moduledoc """
-  Programmatic post-turn verification gate.
+  Post-turn completion verifier.
 
-  The gate is intentionally small: a backend may exit with status 0, but the
-  turn is not marked completed unless the parsed protocol summary says the turn
-  reached a successful terminal event.
+  A successful agent process exit is only a signal that the turn ended. This
+  module dispatches chain-specific checks against external facts and returns the
+  single source of truth for whether `Issues.complete_turn/2` may run.
   """
 
-  @type check :: %{
-          required(:name) => String.t(),
-          required(:status) => String.t(),
-          optional(:message) => String.t()
-        }
+  alias SymphonyElixir.Verification.TodoCode
 
+  @type status :: :passed | :failed
+  @type failure_class :: :retryable | :system | :human_required
   @type result :: %{
-          required(:status) => String.t(),
-          required(:failure_class) => String.t() | nil,
-          required(:reason) => String.t(),
-          required(:chain) => String.t() | nil,
-          required(:issue_id) => String.t() | nil,
-          required(:checks) => [check()]
+          required(:status) => status(),
+          required(:chain) => String.t(),
+          required(:checks) => [map()],
+          optional(:classification) => failure_class(),
+          optional(:reason) => String.t()
         }
 
-  @spec verify_turn(map()) :: {:ok, result()} | {:error, result()}
-  def verify_turn(%{} = context) do
-    checks = [summary_success_check(Map.get(context, :summary, %{}))]
-    failed_checks = Enum.reject(checks, &(&1.status == "passed"))
-
-    result =
-      context
-      |> base_result(checks)
-      |> apply_check_result(failed_checks)
-
-    case result.status do
-      "passed" -> {:ok, result}
-      "failed" -> {:error, result}
-    end
+  @spec verify_turn(String.t(), map(), Path.t(), map(), keyword()) :: {:ok, result()} | {:error, result()}
+  def verify_turn(chain, issue, workspace, summary, opts \\ [])
+      when is_binary(chain) and is_binary(workspace) and is_map(summary) do
+    verifier = verifier_for(chain)
+    verifier.verify(chain, issue, workspace, summary, opts)
   end
 
-  @spec failure_reason(result()) :: atom()
-  def failure_reason(%{reason: "rate_limit"}), do: :rate_limit
-  def failure_reason(%{reason: "human_required"}), do: :human_required
-  def failure_reason(_result), do: :verification_failed
+  @spec retry_reason(result()) :: atom()
+  def retry_reason(%{classification: :human_required}), do: :verification_human_required
+  def retry_reason(%{classification: :system}), do: :verification_system
+  def retry_reason(%{classification: :retryable}), do: :verification_retryable
+  def retry_reason(_result), do: :verification_system
 
-  defp base_result(context, checks) do
-    %{
-      status: "passed",
-      failure_class: nil,
-      reason: "verified",
-      chain: Map.get(context, :chain),
-      issue_id: Map.get(context, :issue_id),
-      checks: checks
-    }
-  end
-
-  defp apply_check_result(result, []), do: result
-
-  defp apply_check_result(result, [first_failed | _]) do
-    %{
-      result
-      | status: "failed",
-        failure_class: Map.get(first_failed, :failure_class, "retryable"),
-        reason: Map.get(first_failed, :reason, "verification_failed")
-    }
-  end
-
-  defp summary_success_check(summary) when is_map(summary) do
-    cond do
-      Map.get(summary, :success) == true ->
-        %{name: "turn_protocol_success", status: "passed"}
-
-      Map.get(summary, :rate_limited) == true or Map.get(summary, :stop_reason) == "rate_limit" ->
-        %{
-          name: "turn_protocol_success",
-          status: "failed",
-          failure_class: "system",
-          reason: "rate_limit",
-          message: "turn summary reported rate limiting"
-        }
-
-      true ->
-        %{
-          name: "turn_protocol_success",
-          status: "failed",
-          failure_class: "retryable",
-          reason: "verification_failed",
-          message: "turn summary did not contain a successful terminal event"
-        }
-    end
-  end
-
-  defp summary_success_check(_summary) do
-    %{
-      name: "turn_protocol_success",
-      status: "failed",
-      failure_class: "retryable",
-      reason: "verification_failed",
-      message: "turn summary was not a map"
-    }
-  end
+  defp verifier_for(chain) when chain in ["todo-code", "changes-requested-code"], do: TodoCode
+  defp verifier_for(chain) when chain in ["code-review-codex", "in-review-qa"], do: SymphonyElixir.Verification.Generic
+  defp verifier_for(_chain), do: SymphonyElixir.Verification.Noop
 end

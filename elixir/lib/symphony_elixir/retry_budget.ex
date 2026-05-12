@@ -4,8 +4,10 @@ defmodule SymphonyElixir.RetryBudget do
 
     * `:auth_revoked` — 3-step (60 / 300 / 900) → quarantined.
       (Lower cap. PR4 promotes this to `auth_blocked` realm pause.)
+    * verifier human/system failures — no retries, immediate quarantine.
     * default (`:turn_timeout`, `:sentinel_missing`, `:rate_limit`,
-      `:nonce_mismatch`, `:unknown`) — 5-step (60 / 300 / 900 / 3600 / 14400).
+      `:nonce_mismatch`, `:unknown`, `:verification_retryable`) — 5-step
+      (60 / 300 / 900 / 3600 / 14400).
 
   Both schedules add ±20% jitter. Clock and RNG are injectable so unit tests
   can pin deterministic timing.
@@ -23,10 +25,12 @@ defmodule SymphonyElixir.RetryBudget do
   @doc "Per-reason schedule (seconds, no jitter)."
   @spec schedule(reason()) :: [pos_integer()]
   def schedule(:auth_revoked), do: @schedule_auth
+  def schedule(:verification_human_required), do: []
+  def schedule(:verification_system), do: []
   def schedule(_), do: @schedule_default
 
   @doc "Cap for a reason — number of attempts before `quarantined`."
-  @spec cap(reason()) :: pos_integer()
+  @spec cap(reason()) :: non_neg_integer()
   def cap(reason), do: length(schedule(reason))
 
   @doc """

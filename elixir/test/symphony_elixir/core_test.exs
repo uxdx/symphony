@@ -46,29 +46,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: nil
     )
 
-    assert {:error, :missing_linear_tracker_scope} = Config.validate!()
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_api_token: "token",
-      tracker_project_slug: nil,
-      tracker_team_key: "AGT1",
-      tracker_required_labels: [" Ready ", "READY"],
-      tracker_exclude_labels: ["Needs Human"]
-    )
-
-    assert :ok = Config.validate!()
-    assert Config.settings!().tracker.team_key == "AGT1"
-    assert Config.settings!().tracker.required_labels == ["ready"]
-    assert Config.settings!().tracker.exclude_labels == ["needs human"]
-
-    write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_required_labels: ["ready"],
-      tracker_exclude_labels: ["Ready"]
-    )
-
-    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
-    assert message =~ "tracker.exclude_labels"
-    assert message =~ "must not overlap required_labels"
+    assert {:error, :missing_linear_project_slug_or_team_key} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",
@@ -108,6 +86,81 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+  end
+
+  test "workflow preflight accepts todo-code team locator and label filters" do
+    workflow_path = Path.join([Path.dirname(Workflow.workflow_file_path()), "todo-code", "WORKFLOW.md"])
+    File.mkdir_p!(Path.dirname(workflow_path))
+
+    write_workflow_file!(workflow_path,
+      tracker_project_slug: nil,
+      tracker_team_key: "AGT1",
+      tracker_required_labels: ["agt1-ready-for-symphony"],
+      tracker_exclude_labels: ["agt1-ready-for-ops"],
+      server_port: 4001
+    )
+
+    assert :ok = Config.preflight_file(workflow_path)
+
+    Workflow.set_workflow_file_path(workflow_path)
+    config = Config.settings!()
+    assert config.tracker.team_key == "AGT1"
+    assert config.tracker.required_labels == ["agt1-ready-for-symphony"]
+    assert config.tracker.exclude_labels == ["agt1-ready-for-ops"]
+  end
+
+  test "workflow preflight reports the chain and field on one line" do
+    workflow_path = Path.join([Path.dirname(Workflow.workflow_file_path()), "todo-code", "WORKFLOW.md"])
+    File.mkdir_p!(Path.dirname(workflow_path))
+
+    File.write!(workflow_path, """
+    ---
+    tracker:
+      kind: linear
+      api_key: token
+      team_key: AGT1
+      mystery: true
+    agent:
+      backend: codex
+    codex:
+      command: codex app-server
+    ---
+    Prompt
+    """)
+
+    assert {:error, message} = Config.preflight_file(workflow_path)
+    assert message == "[todo-code] tracker.mystery: unknown field"
+    refute message =~ "\n"
+  end
+
+  test "workflow preflight rejects missing or mutually exclusive Linear locators" do
+    workflow_path = Path.join([Path.dirname(Workflow.workflow_file_path()), "todo-code", "WORKFLOW.md"])
+    File.mkdir_p!(Path.dirname(workflow_path))
+
+    write_workflow_file!(workflow_path, tracker_project_slug: nil, tracker_team_key: nil)
+
+    assert {:error, message} = Config.preflight_file(workflow_path)
+    assert message == "[todo-code] tracker.project_slug/team_key: set exactly one Linear locator"
+
+    write_workflow_file!(workflow_path, tracker_project_slug: "project", tracker_team_key: "AGT1")
+
+    assert {:error, message} = Config.preflight_file(workflow_path)
+    assert message == "[todo-code] tracker.project_slug/team_key: set exactly one Linear locator"
+  end
+
+  test "workflow preflight rejects active and terminal state overlap" do
+    workflow_path = Path.join([Path.dirname(Workflow.workflow_file_path()), "todo-code", "WORKFLOW.md"])
+    File.mkdir_p!(Path.dirname(workflow_path))
+
+    write_workflow_file!(workflow_path,
+      tracker_project_slug: nil,
+      tracker_team_key: "AGT1",
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Code Review", "In Progress"]
+    )
+
+    assert {:error, message} = Config.preflight_file(workflow_path)
+    assert message == "[todo-code] tracker.active_states/terminal_states: states overlap: in progress"
   end
 
   test "current WORKFLOW.md file is valid and complete" do

@@ -189,6 +189,8 @@ defmodule SymphonyElixir.TestSupport do
           tracker_api_token: "token",
           tracker_project_slug: "project",
           tracker_team_key: nil,
+          tracker_required_labels: [],
+          tracker_exclude_labels: [],
           tracker_assignee: nil,
           tracker_required_labels: [],
           tracker_exclude_labels: [],
@@ -199,6 +201,7 @@ defmodule SymphonyElixir.TestSupport do
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
+          agent_backend: "codex",
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
@@ -230,9 +233,9 @@ defmodule SymphonyElixir.TestSupport do
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
     tracker_team_key = Keyword.get(config, :tracker_team_key)
-    tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_required_labels = Keyword.get(config, :tracker_required_labels)
     tracker_exclude_labels = Keyword.get(config, :tracker_exclude_labels)
+    tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
@@ -240,6 +243,7 @@ defmodule SymphonyElixir.TestSupport do
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
+    agent_backend = Keyword.get(config, :agent_backend)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
@@ -272,9 +276,9 @@ defmodule SymphonyElixir.TestSupport do
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
         "  team_key: #{yaml_value(tracker_team_key)}",
-        "  assignee: #{yaml_value(tracker_assignee)}",
         "  required_labels: #{yaml_value(tracker_required_labels)}",
         "  exclude_labels: #{yaml_value(tracker_exclude_labels)}",
+        "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
@@ -283,6 +287,7 @@ defmodule SymphonyElixir.TestSupport do
         "  root: #{yaml_value(workspace_root)}",
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
+        "  backend: #{yaml_value(agent_backend)}",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",

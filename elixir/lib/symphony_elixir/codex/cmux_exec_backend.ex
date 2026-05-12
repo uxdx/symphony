@@ -61,7 +61,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         {cmd_body, prompt_path} = build_codex_exec_cmd(session, prompt)
 
         try do
-          do_run_turn(session, issue_key, turn_id, attempt_id, cmd_body,
+          do_run_turn(session, issue, issue_key, turn_id, attempt_id, cmd_body,
             chain: chain,
             workspace: workspace,
             timeout: timeout,
@@ -102,32 +102,19 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
     File.write!(prompt_path, sanitize_utf8(prompt))
     File.chmod!(prompt_path, 0o600)
 
-    args =
+    cmd =
       case session.session_id do
         sid when is_binary(sid) and sid != "" ->
-          [
-            exec_command(session),
-            "resume",
-            shell_quote(sid),
-            "--json",
-            "--dangerously-bypass-approvals-and-sandbox"
-          ]
+          "#{exec_command(session)} resume #{shell_quote(sid)} --json --dangerously-bypass-approvals-and-sandbox"
 
         _ ->
-          [
-            exec_command(session),
-            "-C",
-            shell_quote(session.workspace),
-            "--json",
-            "--dangerously-bypass-approvals-and-sandbox"
-          ]
+          "#{exec_command(session)} -C #{shell_quote(session.workspace)} --json --dangerously-bypass-approvals-and-sandbox"
       end
 
     body = """
     #!/usr/bin/env bash
-    [ -f ~/.sazo/secrets.env ] && source ~/.sazo/secrets.env
     export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-    exec #{Enum.join(args, " ")} < #{shell_quote(prompt_path)}
+    exec #{cmd} < #{shell_quote(prompt_path)}
     """
 
     {body, prompt_path}
@@ -176,8 +163,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
     end
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp do_run_turn(session, issue_key, turn_id, attempt_id, cmd_body, ctx) do
+  defp do_run_turn(session, issue, issue_key, turn_id, attempt_id, cmd_body, ctx) do
     chain = Keyword.fetch!(ctx, :chain)
     workspace = Keyword.fetch!(ctx, :workspace)
     timeout = Keyword.fetch!(ctx, :timeout)
@@ -201,30 +187,20 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         summary = ExecJsonParser.summarize(events)
         new_sid = summary[:session_id] || session.session_id
 
-        verification_context = %{
-          issue_id: issue_key,
-          chain: chain,
-          workspace: workspace,
-          backend: "codex_cmux_exec",
-          summary: summary
-        }
+        completion =
+          if state_required? and not is_nil(issue_key) do
+            complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts)
+          else
+            :ok
+          end
 
-        # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-        case Verification.verify_turn(verification_context) do
-          {:ok, verification} ->
-            summary = summary |> Map.put(:verification, verification) |> Map.put(:session_id, new_sid)
-
-            :ok = maybe_complete_turn(state_required?, issue_key, attempt_id, turn_id, chain, new_sid, summary)
-
+        case completion do
+          :ok ->
             new_session = %{session | session_id: new_sid}
-            {:ok, summary, new_session}
+            {:ok, Map.put(summary, :session_id, new_sid), new_session}
 
-          {:error, verification} ->
-            Logger.warning("[codex_cmux] verifier failed reason=#{verification.reason} chain=#{chain}")
-
-            :ok = maybe_fail_turn(state_required?, issue_key, turn_id, attempt_id, chain, verification, summary)
-
-            {:error, {:verification_failed, verification}}
+          {:error, result} ->
+            {:error, {:verification_failed, result}}
         end
 
       {:error, reason} ->
@@ -237,34 +213,6 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         {:error, classified}
     end
   end
-
-  defp maybe_complete_turn(true, issue_key, attempt_id, turn_id, chain, session_id, summary)
-       when not is_nil(issue_key) do
-    :ok =
-      Issues.complete_turn(issue_key, %{
-        attempt_id: attempt_id,
-        turn_id: turn_id,
-        chain: chain,
-        session_id: session_id,
-        summary: summary
-      })
-
-    Mutate.post_turn_comment(issue_key, chain, summary)
-  end
-
-  defp maybe_complete_turn(_state_required?, _issue_key, _attempt_id, _turn_id, _chain, _session_id, _summary),
-    do: :ok
-
-  defp maybe_fail_turn(true, issue_key, turn_id, attempt_id, chain, verification, summary)
-       when not is_nil(issue_key) do
-    handle_turn_failure(issue_key, turn_id, attempt_id, chain, Verification.failure_reason(verification), %{
-      verification: verification,
-      summary: summary
-    })
-  end
-
-  defp maybe_fail_turn(_state_required?, _issue_key, _turn_id, _attempt_id, _chain, _verification, _summary),
-    do: :ok
 
   defp maybe_handle_turn_failure(true, issue_key, turn_id, attempt_id, chain, reason)
        when not is_nil(issue_key) do
@@ -280,6 +228,62 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   defp classify_error({:turn_failed, _code, out}) when is_binary(out), do: classify_stdout(out)
   defp classify_error(_), do: :unknown
 
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts) do
+    :ok =
+      Issues.begin_verification(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        session_id: new_sid,
+        summary: summary
+      })
+
+    case Verification.verify_turn(chain, issue, workspace, summary, opts) do
+      {:ok, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        :ok =
+          Issues.complete_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            session_id: new_sid,
+            summary: summary,
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        :ok
+
+      {:error, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        {:ok, _} =
+          Issues.fail_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            reason: Verification.retry_reason(result),
+            classification: Map.get(result, :classification),
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        {:error, result}
+    end
+  end
+
+  defp record_verification_result(issue_key, turn_id, attempt_id, chain, result) do
+    Issues.record_verification_result(issue_key, %{
+      attempt_id: attempt_id,
+      turn_id: turn_id,
+      chain: chain,
+      result: result
+    })
+  end
+
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp classify_stdout(out) do
     # Scan only the last 50 lines to avoid false positives from prompt content
@@ -289,18 +293,22 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
       |> String.split("\n")
       |> Enum.take(-50)
       |> Enum.join("\n")
+      |> String.downcase()
 
     cond do
-      String.contains?(tail, "TokenRefreshFailed") or
+      String.contains?(tail, "tokenrefreshfailed") or
         String.contains?(tail, "invalid_grant") or
         String.contains?(tail, "auth_required") or
-          String.contains?(tail, "Not logged in") ->
+        String.contains?(tail, "not logged in") or
+          String.contains?(tail, "credentials") ->
         :auth_revoked
 
-      String.contains?(tail, "Rate limit exceeded") or
-        String.contains?(tail, "Too Many Requests") or
+      String.contains?(tail, "rate limit exceeded") or
+        String.contains?(tail, "too many requests") or
         String.contains?(tail, "rate_limit_exceeded") or
-          String.contains?(tail, "HTTP 429") ->
+        String.contains?(tail, "http 429") or
+        String.contains?(tail, "429") or
+          String.contains?(tail, "quota") ->
         :rate_limit
 
       String.contains?(tail, "timeout") or

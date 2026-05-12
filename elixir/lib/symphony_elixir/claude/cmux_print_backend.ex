@@ -64,7 +64,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         {cmd_body, prompt_path} = build_claude_print_cmd(session, prompt, opts)
 
         try do
-          do_run_turn(session, issue_key, turn_id, attempt_id, fence_seq, cmd_body,
+          do_run_turn(session, issue, issue_key, turn_id, attempt_id, fence_seq, cmd_body,
             chain: chain,
             workspace: workspace,
             timeout: timeout,
@@ -196,15 +196,11 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     cond do
       String.contains?(tail, "not logged in") or
         String.contains?(tail, "auth_required") or
-        String.contains?(tail, "tokenrefreshfailed") or
-        String.contains?(tail, "invalid_grant") or
         String.contains?(tail, "401") or
           String.contains?(tail, "credentials") ->
         :auth_revoked
 
       String.contains?(tail, "rate limit") or
-        String.contains?(tail, "too many requests") or
-        String.contains?(tail, "rate_limit_exceeded") or
         String.contains?(tail, "429") or
           String.contains?(tail, "quota") ->
         :rate_limit
@@ -272,6 +268,62 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     "'" <> String.replace(s, "'", "'\\''") <> "'"
   end
 
+  # credo:disable-for-next-line Credo.Check.Refactor.FunctionArity
+  defp complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts) do
+    :ok =
+      Issues.begin_verification(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        session_id: new_sid,
+        summary: summary
+      })
+
+    case Verification.verify_turn(chain, issue, workspace, summary, opts) do
+      {:ok, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        :ok =
+          Issues.complete_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            session_id: new_sid,
+            summary: summary,
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        :ok
+
+      {:error, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        {:ok, _} =
+          Issues.fail_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            reason: Verification.retry_reason(result),
+            classification: Map.get(result, :classification),
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        {:error, result}
+    end
+  end
+
+  defp record_verification_result(issue_key, turn_id, attempt_id, chain, result) do
+    Issues.record_verification_result(issue_key, %{
+      attempt_id: attempt_id,
+      turn_id: turn_id,
+      chain: chain,
+      result: result
+    })
+  end
+
   ## Internals
 
   defp issue_key(%{identifier: id}) when is_binary(id) and id != "", do: id
@@ -304,8 +356,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     end
   end
 
-  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
-  defp do_run_turn(session, issue_key, turn_id, attempt_id, _fence_seq, cmd_body, ctx) do
+  defp do_run_turn(session, issue, issue_key, turn_id, attempt_id, _fence_seq, cmd_body, ctx) do
     chain = Keyword.fetch!(ctx, :chain)
     workspace = Keyword.fetch!(ctx, :workspace)
     timeout = Keyword.fetch!(ctx, :timeout)
@@ -329,30 +380,20 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         summary = StreamJsonParser.summarize(events)
         new_sid = summary[:session_id] || session.session_id
 
-        verification_context = %{
-          issue_id: issue_key,
-          chain: chain,
-          workspace: workspace,
-          backend: "claude_cmux_print",
-          summary: summary
-        }
+        completion =
+          if state_required? and not is_nil(issue_key) do
+            complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts)
+          else
+            :ok
+          end
 
-        # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-        case Verification.verify_turn(verification_context) do
-          {:ok, verification} ->
-            summary = summary |> Map.put(:verification, verification) |> Map.put(:session_id, new_sid)
-
-            :ok = maybe_complete_turn(state_required?, issue_key, attempt_id, turn_id, chain, new_sid, summary)
-
+        case completion do
+          :ok ->
             new_session = %{session | session_id: new_sid}
-            {:ok, summary, new_session}
+            {:ok, Map.put(summary, :session_id, new_sid), new_session}
 
-          {:error, verification} ->
-            Logger.warning("[claude_cmux] verifier failed reason=#{verification.reason} chain=#{chain}")
-
-            :ok = maybe_fail_turn(state_required?, issue_key, turn_id, attempt_id, chain, verification, summary)
-
-            {:error, {:verification_failed, verification}}
+          {:error, result} ->
+            {:error, {:verification_failed, result}}
         end
 
       {:error, reason} ->
@@ -365,34 +406,6 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         {:error, classified}
     end
   end
-
-  defp maybe_complete_turn(true, issue_key, attempt_id, turn_id, chain, session_id, summary)
-       when not is_nil(issue_key) do
-    :ok =
-      Issues.complete_turn(issue_key, %{
-        attempt_id: attempt_id,
-        turn_id: turn_id,
-        chain: chain,
-        session_id: session_id,
-        summary: summary
-      })
-
-    Mutate.post_turn_comment(issue_key, chain, summary)
-  end
-
-  defp maybe_complete_turn(_state_required?, _issue_key, _attempt_id, _turn_id, _chain, _session_id, _summary),
-    do: :ok
-
-  defp maybe_fail_turn(true, issue_key, turn_id, attempt_id, chain, verification, summary)
-       when not is_nil(issue_key) do
-    handle_turn_failure(issue_key, turn_id, attempt_id, chain, Verification.failure_reason(verification), %{
-      verification: verification,
-      summary: summary
-    })
-  end
-
-  defp maybe_fail_turn(_state_required?, _issue_key, _turn_id, _attempt_id, _chain, _verification, _summary),
-    do: :ok
 
   defp maybe_handle_turn_failure(true, issue_key, turn_id, attempt_id, chain, reason)
        when not is_nil(issue_key) do

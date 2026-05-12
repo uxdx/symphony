@@ -397,6 +397,10 @@ pre,
   color: var(--muted);
 }
 
+.danger-text {
+  color: var(--danger);
+}
+
 .code-panel {
   margin-top: 1rem;
   padding: 1rem;

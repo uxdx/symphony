@@ -2,6 +2,7 @@ defmodule SymphonyElixir.VerificationTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.Codex.CmuxExecBackend
+  alias SymphonyElixir.Linear.Issue
   alias SymphonyElixir.State.AuthRealms
   alias SymphonyElixir.State.Issues
   alias SymphonyElixir.Verification
@@ -39,16 +40,20 @@ defmodule SymphonyElixir.VerificationTest do
   end
 
   test "verifier passes when the protocol summary reports success" do
-    assert {:ok, result} =
-             Verification.verify_turn(%{
-               issue_id: "TEST-VERIFY-PASS",
-               chain: "todo-code",
-               summary: %{success: true, stop_reason: "completed"}
-             })
+    issue_id = "TEST-VERIFY-PASS"
+    workspace = temp_workspace!("protocol-pass")
 
-    assert result.status == "passed"
-    assert result.reason == "verified"
-    assert [%{name: "turn_protocol_success", status: "passed"}] = result.checks
+    assert {:ok, result} =
+             Verification.verify_turn(
+               "todo-code",
+               %Issue{id: issue_id, identifier: issue_id, state: "In Progress"},
+               workspace,
+               %{success: true, stop_reason: "completed"},
+               verifier_opts(issue_id, workspace)
+             )
+
+    assert result.status == :passed
+    assert Enum.any?(result.checks, &(&1.name == "turn_protocol_success" and &1.status == :passed))
   end
 
   test "todo-code codex backend completes only after verifier pass" do
@@ -70,11 +75,15 @@ defmodule SymphonyElixir.VerificationTest do
              )
 
     assert {:ok, summary, new_session} =
-             CmuxExecBackend.run_turn(session, "Do the work", %{identifier: issue_id}, [])
+             CmuxExecBackend.run_turn(
+               session,
+               "Do the work",
+               %Issue{id: issue_id, identifier: issue_id, state: "In Progress"},
+               verifier_opts(issue_id, workspace)
+             )
 
     assert summary.success
     assert summary.session_id == "sess-pass"
-    assert summary.verification.status == "passed"
     assert new_session.session_id == "sess-pass"
 
     assert_receive {:run_turn, "todo-code", opts}
@@ -103,15 +112,20 @@ defmodule SymphonyElixir.VerificationTest do
              )
 
     assert {:error, {:verification_failed, verification}} =
-             CmuxExecBackend.run_turn(session, "Do the work", %{identifier: issue_id}, [])
+             CmuxExecBackend.run_turn(
+               session,
+               "Do the work",
+               %Issue{id: issue_id, identifier: issue_id, state: "In Progress"},
+               verifier_opts(issue_id, workspace)
+             )
 
-    assert verification.status == "failed"
-    assert verification.failure_class == "retryable"
-    assert verification.reason == "verification_failed"
+    assert verification.status == :failed
+    assert verification.classification == :retryable
+    assert verification.reason == "turn_protocol_success"
 
     assert {:ok, row} = Issues.get(issue_id)
     assert row.state == "retryable_failed"
-    assert row.last_failure_reason == "verification_failed"
+    assert row.last_failure_reason == "verification_retryable"
   end
 
   defp unique_issue_id(label) do
@@ -123,6 +137,26 @@ defmodule SymphonyElixir.VerificationTest do
     File.mkdir_p!(path)
     path
   end
+
+  defp verifier_opts(issue_id, workspace) do
+    [
+      expected_branch: "feature/test",
+      issue_state_fetcher: fn [^issue_id] ->
+        {:ok, [%Issue{id: issue_id, identifier: issue_id, state: "Code Review"}]}
+      end,
+      issue_comment_fetcher: fn ^issue_id ->
+        {:ok, [%{"body" => "## Codex Workpad\n\n### Validation\n- [x] unit"}]}
+      end,
+      git_runner: fn ^workspace, args -> fake_git(issue_id, args) end
+    ]
+  end
+
+  defp fake_git(_issue_id, ["rev-parse", "--abbrev-ref", "HEAD"]), do: {:ok, "feature/test\n"}
+  defp fake_git(_issue_id, ["status", "--porcelain"]), do: {:ok, ""}
+  defp fake_git(_issue_id, ["rev-parse", "HEAD"]), do: {:ok, "abc123\n"}
+  defp fake_git(_issue_id, ["rev-parse", "origin/feature/test"]), do: {:ok, "abc123\n"}
+  defp fake_git(issue_id, ["log", "-50", "--format=%H%x09%s", "--grep=" <> issue_id]), do: {:ok, "abc123\t#{issue_id}\n"}
+  defp fake_git(_issue_id, args), do: {:error, %{exit_code: 1, output: Enum.join(args, " ")}}
 
   defp jsonl(events) do
     Enum.map_join(events, "\n", &Jason.encode!/1)

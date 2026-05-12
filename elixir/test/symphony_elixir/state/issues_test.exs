@@ -53,6 +53,54 @@ defmodule SymphonyElixir.State.IssuesTest do
   end
 
   describe "complete_turn/2" do
+    test "records verifier result before completing from verifying state" do
+      issue_id = unique_issue_id("verify-pass")
+
+      {:ok, %{turn_id: turn_id, attempt_id: attempt_id}} =
+        Issues.begin_turn(issue_id, "todo-code")
+
+      summary = %{tokens_in: 5, tokens_out: 18, success: true}
+      verifier = %{status: :passed, chain: "todo-code", checks: [%{name: "linear.target_state", status: :passed}]}
+
+      assert :ok =
+               Issues.begin_verification(issue_id, %{
+                 attempt_id: attempt_id,
+                 turn_id: turn_id,
+                 chain: "todo-code",
+                 session_id: "sess-verify",
+                 summary: summary
+               })
+
+      {:ok, verifying_row} = Issues.get(issue_id)
+      assert verifying_row.state == "verifying"
+
+      assert :ok =
+               Issues.record_verification_result(issue_id, %{
+                 attempt_id: attempt_id,
+                 turn_id: turn_id,
+                 chain: "todo-code",
+                 result: verifier
+               })
+
+      assert :ok =
+               Issues.complete_turn(issue_id, %{
+                 attempt_id: attempt_id,
+                 turn_id: turn_id,
+                 chain: "todo-code",
+                 session_id: "sess-verify",
+                 summary: summary,
+                 verification: verifier,
+                 expected_state: "verifying"
+               })
+
+      {:ok, row} = Issues.get(issue_id)
+      assert row.state == "completed"
+
+      wal = File.read!(State.default_wal_path())
+      assert wal =~ "\"kind\":\"verification_passed\""
+      assert wal =~ "\"verifier\""
+    end
+
     test "marks issue completed and clears retry/owner fields" do
       issue_id = unique_issue_id("complete")
 
@@ -221,23 +269,159 @@ defmodule SymphonyElixir.State.IssuesTest do
     end
   end
 
+  describe "boot stale turn_running reconciliation" do
+    test "demotes dead-owner turn_running rows to retryable_failed" do
+      issue_id = unique_issue_id("stale-boot")
+
+      {:ok, %{attempt_id: attempt_id}} = Issues.begin_turn(issue_id, "c-stale-boot")
+      dead_boot_run_id = insert_boot_run!(pid: 0)
+      set_issue_owner_boot_run!(issue_id, dead_boot_run_id)
+
+      assert {:ok, %{reconciled: reconciled_rows}} =
+               Issues.reconcile_stale_turn_running_on_boot(
+                 pid_alive?: fn _pid -> false end,
+                 now: fn -> 1_000_000 end,
+                 rand: fn -> 0.5 end
+               )
+
+      assert reconciled = Enum.find(reconciled_rows, &(&1.issue_id == issue_id))
+      assert reconciled.issue_id == issue_id
+      assert reconciled.state == "retryable_failed"
+      assert reconciled.stale_reason == :owner_pid_dead
+      assert reconciled.retry_next_at == 1_000_060
+
+      {:ok, row} = Issues.get(issue_id)
+      assert row.state == "retryable_failed"
+      assert row.last_failure_reason == "stale_owner_boot"
+      assert is_nil(row.owner_boot_run_id)
+      assert is_nil(row.current_turn_id)
+
+      assert turn_attempt_state(issue_id, attempt_id) == "failed"
+    end
+
+    test "skips live-owner turn_running rows and reports DB/runtime mismatch" do
+      issue_id = unique_issue_id("live-owner")
+
+      {:ok, _} = Issues.begin_turn(issue_id, "c-live-owner")
+      live_boot_run_id = insert_boot_run!(pid: 12_345)
+      set_issue_owner_boot_run!(issue_id, live_boot_run_id)
+
+      assert {:ok, %{skipped: skipped_rows}} =
+               Issues.reconcile_stale_turn_running_on_boot(
+                 pid_alive?: fn 12_345 -> true end,
+                 now: fn -> 1_000_000 end,
+                 rand: fn -> 0.5 end
+               )
+
+      assert skipped = Enum.find(skipped_rows, &(&1.issue_id == issue_id))
+      assert skipped.issue_id == issue_id
+      assert skipped.skip_reason == :owner_pid_alive
+
+      assert %{issue_id: ^issue_id, owner_status: owner_status} =
+               Enum.find(Issues.turn_running_not_in_runtime([]), &(&1.issue_id == issue_id))
+
+      assert owner_status in ["owner_pid_alive", "owner_pid_dead"]
+    end
+  end
+
+  describe "janitor findings" do
+    test "detects running turn attempts whose issue is no longer running" do
+      issue_id = unique_issue_id("orphan")
+      {:ok, %{attempt_id: attempt_id}} = Issues.begin_turn(issue_id, "c-orphan")
+
+      force_issue_state!(issue_id, "retryable_failed")
+
+      assert [
+               %{
+                 issue_id: ^issue_id,
+                 attempt_id: ^attempt_id,
+                 state: "running",
+                 issue_state: "retryable_failed",
+                 orphan_reason: "issue_state_retryable_failed"
+               }
+             ] = Issues.orphaned_turn_attempts()
+    end
+  end
+
+  defp insert_boot_run!(attrs) do
+    {:ok, boot_run_id} =
+      State.transaction(fn conn ->
+        {:ok, stmt} =
+          Sqlite3.prepare(
+            conn,
+            "INSERT INTO boot_runs(started_at, pid, hostname) VALUES (?, ?, ?) RETURNING boot_run_id"
+          )
+
+        :ok = Sqlite3.bind(stmt, [System.system_time(:second), Keyword.fetch!(attrs, :pid), "test-host"])
+        {:row, [boot_run_id]} = Sqlite3.step(conn, stmt)
+        :ok = Sqlite3.release(conn, stmt)
+        boot_run_id
+      end)
+
+    boot_run_id
+  end
+
+  defp set_issue_owner_boot_run!(issue_id, boot_run_id) do
+    {:ok, :ok} =
+      State.transaction(fn conn ->
+        exec!(conn, "UPDATE issues SET owner_boot_run_id = ? WHERE issue_id = ?", [boot_run_id, issue_id])
+      end)
+
+    :ok
+  end
+
+  defp force_issue_state!(issue_id, state) do
+    {:ok, :ok} =
+      State.transaction(fn conn ->
+        exec!(conn, "UPDATE issues SET state = ?, owner_boot_run_id = NULL WHERE issue_id = ?", [
+          state,
+          issue_id
+        ])
+      end)
+
+    :ok
+  end
+
+  defp turn_attempt_state(issue_id, attempt_id) do
+    {:ok, state} =
+      State.transaction(fn conn ->
+        {:ok, stmt} =
+          Sqlite3.prepare(
+            conn,
+            "SELECT state FROM turn_attempts WHERE issue_id = ? AND attempt_id = ?"
+          )
+
+        :ok = Sqlite3.bind(stmt, [issue_id, attempt_id])
+        {:row, [state]} = Sqlite3.step(conn, stmt)
+        :ok = Sqlite3.release(conn, stmt)
+        state
+      end)
+
+    state
+  end
+
   defp fetch_turn_attempt(issue_id, attempt_id) do
-    State.transaction(fn conn ->
-      {:ok, stmt} =
-        Sqlite3.prepare(
-          conn,
-          "SELECT state, reason FROM turn_attempts WHERE issue_id = ? AND attempt_id = ?"
-        )
+    {:ok, result} =
+      State.transaction(fn conn ->
+        {:ok, stmt} =
+          Sqlite3.prepare(
+            conn,
+            "SELECT state, reason FROM turn_attempts WHERE issue_id = ? AND attempt_id = ?"
+          )
 
-      :ok = Sqlite3.bind(stmt, [issue_id, attempt_id])
-      result = Sqlite3.step(conn, stmt)
-      :ok = Sqlite3.release(conn, stmt)
+        :ok = Sqlite3.bind(stmt, [issue_id, attempt_id])
 
-      case result do
-        {:row, [state, reason]} -> %{state: state, reason: reason}
-        :done -> nil
-      end
-    end)
+        result =
+          case Sqlite3.step(conn, stmt) do
+            {:row, [state, reason]} -> {:ok, %{state: state, reason: reason}}
+            :done -> {:error, :not_found}
+          end
+
+        :ok = Sqlite3.release(conn, stmt)
+        result
+      end)
+
+    result
   end
 
   defp exec!(conn, sql, params) do

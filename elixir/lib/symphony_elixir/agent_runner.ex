@@ -128,19 +128,16 @@ defmodule SymphonyElixir.AgentRunner do
          max_turns
        ) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
-    on_message = codex_message_handler(codex_update_recipient, issue)
 
-    case CmuxExecBackend.run_turn(session, prompt, issue, on_message: on_message) do
+    turn_opts =
+      opts
+      |> Keyword.take([:issue_comment_fetcher, :git_runner, :expected_branch])
+      |> Keyword.put(:issue_state_fetcher, issue_state_fetcher)
+      |> Keyword.put(:on_message, codex_message_handler(codex_update_recipient, issue))
+
+    case CmuxExecBackend.run_turn(session, prompt, issue, turn_opts) do
       {:ok, summary, new_session} ->
-        Logger.info([
-          "Completed codex_exec turn for ",
-          issue_context(issue),
-          " session_id=",
-          to_string(summary[:session_id]),
-          " workspace=",
-          workspace,
-          " turn=#{turn_number}/#{max_turns}"
-        ])
+        Logger.info("Completed codex_exec turn for #{issue_context(issue)} session_id=#{summary[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
         case continue_with_issue?(issue, issue_state_fetcher) do
           {:continue, refreshed_issue} when turn_number < max_turns ->
@@ -156,11 +153,7 @@ defmodule SymphonyElixir.AgentRunner do
             )
 
           {:continue, refreshed_issue} ->
-            Logger.info([
-              "Reached agent.max_turns for ",
-              issue_context(refreshed_issue),
-              " (codex_exec) — returning control to orchestrator"
-            ])
+            Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} (codex_exec) — returning control to orchestrator")
 
             :ok
 
