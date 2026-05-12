@@ -24,6 +24,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   alias SymphonyElixir.Cmux
   alias SymphonyElixir.Agent.StreamJsonParser
   alias SymphonyElixir.Linear.Mutate
+  alias SymphonyElixir.Verification
   alias SymphonyElixir.State.Issues
   alias SymphonyElixir.State.AuthRealms
 
@@ -61,7 +62,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         {cmd_body, prompt_path} = build_claude_print_cmd(session, prompt, opts)
 
         try do
-          do_run_turn(session, issue_key, turn_id, attempt_id, fence_seq, cmd_body,
+          do_run_turn(session, issue, issue_key, turn_id, attempt_id, fence_seq, cmd_body,
             chain: chain,
             workspace: workspace,
             timeout: timeout,
@@ -166,8 +167,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     * `:rate_limit` — stdout contains "rate limit" / "429" / "quota"
     * `:unknown` — anything else
   """
-  @spec classify_error(term()) :: :turn_timeout | :sentinel_missing | :nonce_mismatch
-                                     | :auth_revoked | :rate_limit | :unknown
+  @spec classify_error(term()) :: :turn_timeout | :sentinel_missing | :nonce_mismatch | :auth_revoked | :rate_limit | :unknown
   def classify_error(:turn_timeout), do: :turn_timeout
   def classify_error(:sentinel_missing), do: :sentinel_missing
   def classify_error({:nonce_mismatch, _out}), do: :nonce_mismatch
@@ -179,13 +179,13 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
   defp classify_stdout(out) do
     cond do
       String.contains?(out, "Not logged in") or
-          String.contains?(out, "auth_required") or
-          String.contains?(out, "401") or
+        String.contains?(out, "auth_required") or
+        String.contains?(out, "401") or
           String.contains?(out, "credentials") ->
         :auth_revoked
 
       String.contains?(out, "rate limit") or
-          String.contains?(out, "429") or
+        String.contains?(out, "429") or
           String.contains?(out, "quota") ->
         :rate_limit
 
@@ -241,6 +241,61 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     "'" <> String.replace(s, "'", "'\\''") <> "'"
   end
 
+  defp complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts) do
+    :ok =
+      Issues.begin_verification(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        session_id: new_sid,
+        summary: summary
+      })
+
+    case Verification.verify_turn(chain, issue, workspace, summary, opts) do
+      {:ok, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        :ok =
+          Issues.complete_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            session_id: new_sid,
+            summary: summary,
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        :ok
+
+      {:error, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        {:ok, _} =
+          Issues.fail_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            reason: Verification.retry_reason(result),
+            classification: Map.get(result, :classification),
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        {:error, result}
+    end
+  end
+
+  defp record_verification_result(issue_key, turn_id, attempt_id, chain, result) do
+    Issues.record_verification_result(issue_key, %{
+      attempt_id: attempt_id,
+      turn_id: turn_id,
+      chain: chain,
+      result: result
+    })
+  end
+
   ## Internals
 
   defp issue_key(%{identifier: id}) when is_binary(id) and id != "", do: id
@@ -273,7 +328,7 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
     end
   end
 
-  defp do_run_turn(session, issue_key, turn_id, attempt_id, _fence_seq, cmd_body, ctx) do
+  defp do_run_turn(session, issue, issue_key, turn_id, attempt_id, _fence_seq, cmd_body, ctx) do
     chain = Keyword.fetch!(ctx, :chain)
     workspace = Keyword.fetch!(ctx, :workspace)
     timeout = Keyword.fetch!(ctx, :timeout)
@@ -295,28 +350,26 @@ defmodule SymphonyElixir.Claude.CmuxPrintBackend do
         summary = StreamJsonParser.summarize(events)
         new_sid = summary[:session_id] || session.session_id
 
-        if state_required? and not is_nil(issue_key) do
-          :ok =
-            Issues.complete_turn(issue_key, %{
-              attempt_id: attempt_id,
-              turn_id: turn_id,
-              chain: chain,
-              session_id: new_sid,
-              summary: summary
-            })
+        completion =
+          if state_required? and not is_nil(issue_key) do
+            complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts)
+          else
+            :ok
+          end
 
-          :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        case completion do
+          :ok ->
+            new_session = %{session | session_id: new_sid}
+            {:ok, Map.put(summary, :session_id, new_sid), new_session}
+
+          {:error, result} ->
+            {:error, {:verification_failed, result}}
         end
-
-        new_session = %{session | session_id: new_sid}
-        {:ok, Map.put(summary, :session_id, new_sid), new_session}
 
       {:error, reason} ->
         classified = classify_error(reason)
 
-        Logger.warning(
-          "[claude_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}"
-        )
+        Logger.warning("[claude_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}")
 
         if state_required? and not is_nil(issue_key) do
           handle_turn_failure(issue_key, turn_id, attempt_id, chain, classified)

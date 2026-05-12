@@ -52,6 +52,54 @@ defmodule SymphonyElixir.State.IssuesTest do
   end
 
   describe "complete_turn/2" do
+    test "records verifier result before completing from verifying state" do
+      issue_id = unique_issue_id("verify-pass")
+
+      {:ok, %{turn_id: turn_id, attempt_id: attempt_id}} =
+        Issues.begin_turn(issue_id, "todo-code")
+
+      summary = %{tokens_in: 5, tokens_out: 18, success: true}
+      verifier = %{status: :passed, chain: "todo-code", checks: [%{name: "linear.target_state", status: :passed}]}
+
+      assert :ok =
+               Issues.begin_verification(issue_id, %{
+                 attempt_id: attempt_id,
+                 turn_id: turn_id,
+                 chain: "todo-code",
+                 session_id: "sess-verify",
+                 summary: summary
+               })
+
+      {:ok, verifying_row} = Issues.get(issue_id)
+      assert verifying_row.state == "verifying"
+
+      assert :ok =
+               Issues.record_verification_result(issue_id, %{
+                 attempt_id: attempt_id,
+                 turn_id: turn_id,
+                 chain: "todo-code",
+                 result: verifier
+               })
+
+      assert :ok =
+               Issues.complete_turn(issue_id, %{
+                 attempt_id: attempt_id,
+                 turn_id: turn_id,
+                 chain: "todo-code",
+                 session_id: "sess-verify",
+                 summary: summary,
+                 verification: verifier,
+                 expected_state: "verifying"
+               })
+
+      {:ok, row} = Issues.get(issue_id)
+      assert row.state == "completed"
+
+      wal = File.read!(State.default_wal_path())
+      assert wal =~ "\"kind\":\"verification_passed\""
+      assert wal =~ "\"verifier\""
+    end
+
     test "marks issue completed and clears retry/owner fields" do
       issue_id = unique_issue_id("complete")
 

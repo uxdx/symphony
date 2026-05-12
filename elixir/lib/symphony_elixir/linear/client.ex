@@ -148,6 +148,21 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @comments_query """
+  query SymphonyLinearIssueComments($id: String!, $first: Int!) {
+    issue(id: $id) {
+      comments(first: $first) {
+        nodes {
+          id
+          body
+          createdAt
+          updatedAt
+        }
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
@@ -208,6 +223,18 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, assignee_filter)
         end
+    end
+  end
+
+  @spec fetch_issue_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    with {:ok, %{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}}}
+         when is_list(nodes) <- graphql(@comments_query, %{id: issue_id, first: @issue_page_size}) do
+      {:ok, nodes}
+    else
+      %{"errors" => errors} -> {:error, {:linear_graphql_errors, errors}}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :linear_unknown_payload}
     end
   end
 

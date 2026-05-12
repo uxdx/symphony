@@ -56,7 +56,7 @@ defmodule SymphonyElixir.State.Issues do
         now = System.system_time(:second)
 
         existing = fetch_issue(conn, issue_id)
-        attempt_id = (existing && existing.attempt_id || 0) + 1
+        attempt_id = ((existing && existing.attempt_id) || 0) + 1
         turn_id = generate_turn_id(issue_id, now)
 
         {:ok, fence_seq} = State.allocate_fence(conn)
@@ -89,16 +89,17 @@ defmodule SymphonyElixir.State.Issues do
           started_at: now
         })
 
-        :ok = insert_event_in_tx(conn, %{
-          ts: now,
-          boot_run_id: boot_run_id,
-          fence_seq: fence_seq,
-          issue_id: issue_id,
-          turn_id: turn_id,
-          chain: chain,
-          kind: "turn_running",
-          payload: %{attempt_id: attempt_id}
-        })
+        :ok =
+          insert_event_in_tx(conn, %{
+            ts: now,
+            boot_run_id: boot_run_id,
+            fence_seq: fence_seq,
+            issue_id: issue_id,
+            turn_id: turn_id,
+            chain: chain,
+            kind: "turn_running",
+            payload: %{attempt_id: attempt_id}
+          })
 
         %{turn_id: turn_id, attempt_id: attempt_id, fence_seq: fence_seq}
       end)
@@ -106,8 +107,130 @@ defmodule SymphonyElixir.State.Issues do
   end
 
   @doc """
-  Mark the in-flight turn as completed. Asserts CAS on
-  `(state = 'turn_running' AND fence_seq = ? AND attempt_id = ?)`.
+  Move the in-flight turn from `turn_running` to `verifying` before external
+  completion checks run. The issue is not terminal while a verifier is running.
+  """
+  @spec begin_verification(String.t(), map()) :: :ok | {:error, term()}
+  def begin_verification(issue_id, %{} = info) do
+    with_issue_lock(issue_id, fn ->
+      State.transaction(fn conn ->
+        now = System.system_time(:second)
+        boot_run_id = boot_run_id_safe()
+        {:ok, fence_seq} = State.allocate_fence(conn)
+        attempt_id = Map.fetch!(info, :attempt_id)
+
+        assert_state!(conn, issue_id, "turn_running", attempt_id)
+
+        :ok =
+          exec!(
+            conn,
+            """
+            UPDATE issues
+               SET state           = 'verifying',
+                   session_id      = ?,
+                   fence_seq       = ?,
+                   last_event_at   = ?,
+                   last_event_kind = 'verification_started'
+             WHERE issue_id = ?
+            """,
+            [
+              Map.get(info, :session_id),
+              fence_seq,
+              now,
+              issue_id
+            ]
+          )
+
+        :ok =
+          exec!(
+            conn,
+            """
+            UPDATE turn_attempts
+               SET state            = 'verifying',
+                   session_id       = ?,
+                   raw_summary_json = ?
+             WHERE issue_id = ? AND attempt_id = ?
+            """,
+            [
+              Map.get(info, :session_id),
+              Jason.encode!(Map.get(info, :summary, %{})),
+              issue_id,
+              attempt_id
+            ]
+          )
+
+        :ok =
+          insert_event_in_tx(conn, %{
+            ts: now,
+            boot_run_id: boot_run_id,
+            fence_seq: fence_seq,
+            issue_id: issue_id,
+            turn_id: Map.get(info, :turn_id),
+            chain: Map.get(info, :chain),
+            kind: "verification_started",
+            payload: %{summary: Map.get(info, :summary, %{})}
+          })
+
+        :ok
+      end)
+    end)
+    |> normalize_tx_result()
+  end
+
+  @doc """
+  Record a structured post-turn verifier result. This does not complete or fail
+  the issue; callers must perform the next transition explicitly.
+  """
+  @spec record_verification_result(String.t(), map()) :: :ok | {:error, term()}
+  def record_verification_result(issue_id, %{} = info) do
+    with_issue_lock(issue_id, fn ->
+      State.transaction(fn conn ->
+        now = System.system_time(:second)
+        boot_run_id = boot_run_id_safe()
+        {:ok, fence_seq} = State.allocate_fence(conn)
+        attempt_id = Map.fetch!(info, :attempt_id)
+        result = Map.fetch!(info, :result)
+        status = Map.get(result, :status) || Map.get(result, "status") || :unknown
+        kind = "verification_#{status}"
+
+        assert_state!(conn, issue_id, "verifying", attempt_id)
+
+        :ok =
+          exec!(
+            conn,
+            """
+            UPDATE issues
+               SET fence_seq       = ?,
+                   last_event_at   = ?,
+                   last_event_kind = ?
+             WHERE issue_id = ?
+            """,
+            [fence_seq, now, kind, issue_id]
+          )
+
+        :ok =
+          insert_event_in_tx(conn, %{
+            ts: now,
+            boot_run_id: boot_run_id,
+            fence_seq: fence_seq,
+            issue_id: issue_id,
+            turn_id: Map.get(info, :turn_id),
+            chain: Map.get(info, :chain),
+            kind: kind,
+            payload: %{verifier: result}
+          })
+
+        :ok
+      end)
+    end)
+    |> normalize_tx_result()
+  end
+
+  @doc """
+  Mark the in-flight turn as completed. By default this asserts
+  `state = 'turn_running'`; post-turn verifier callers pass
+  `expected_state: "verifying"` so durable completion only happens after the
+  verifier result has been recorded.
   """
   @spec complete_turn(String.t(), map()) :: :ok | {:error, term()}
   def complete_turn(issue_id, %{} = info) do
@@ -117,66 +240,78 @@ defmodule SymphonyElixir.State.Issues do
         boot_run_id = boot_run_id_safe()
         {:ok, fence_seq} = State.allocate_fence(conn)
         attempt_id = Map.fetch!(info, :attempt_id)
+        expected_state = Map.get(info, :expected_state, "turn_running")
 
         # CAS guard
-        assert_state!(conn, issue_id, "turn_running", attempt_id)
+        assert_state!(conn, issue_id, expected_state, attempt_id)
 
-        :ok = exec!(conn, """
-        UPDATE issues
-           SET state            = 'completed',
-               session_id       = ?,
-               attempt_id       = ?,
-               retry_budget_used = 0,
-               retry_next_at    = NULL,
-               last_failure_reason = NULL,
-               owner_boot_run_id = NULL,
-               claim_expires_at = NULL,
-               fence_seq        = ?,
-               current_turn_id  = NULL,
-               last_event_at    = ?,
-               last_event_kind  = 'completed'
-         WHERE issue_id = ?
-        """, [
-          Map.get(info, :session_id),
-          attempt_id,
-          fence_seq,
-          now,
-          issue_id
-        ])
+        :ok =
+          exec!(
+            conn,
+            """
+            UPDATE issues
+               SET state            = 'completed',
+                   session_id       = ?,
+                   attempt_id       = ?,
+                   retry_budget_used = 0,
+                   retry_next_at    = NULL,
+                   last_failure_reason = NULL,
+                   owner_boot_run_id = NULL,
+                   claim_expires_at = NULL,
+                   fence_seq        = ?,
+                   current_turn_id  = NULL,
+                   last_event_at    = ?,
+                   last_event_kind  = 'completed'
+             WHERE issue_id = ?
+            """,
+            [
+              Map.get(info, :session_id),
+              attempt_id,
+              fence_seq,
+              now,
+              issue_id
+            ]
+          )
 
         summary = Map.get(info, :summary, %{})
 
-        :ok = exec!(conn, """
-        UPDATE turn_attempts
-           SET state            = 'completed',
-               session_id       = ?,
-               tokens_in        = ?,
-               tokens_out       = ?,
-               tool_calls       = ?,
-               ended_at         = ?,
-               raw_summary_json = ?
-         WHERE issue_id = ? AND attempt_id = ?
-        """, [
-          Map.get(info, :session_id),
-          Map.get(summary, :tokens_in),
-          Map.get(summary, :tokens_out),
-          Map.get(summary, :tool_calls),
-          now,
-          Jason.encode!(summary),
-          issue_id,
-          attempt_id
-        ])
+        :ok =
+          exec!(
+            conn,
+            """
+            UPDATE turn_attempts
+               SET state            = 'completed',
+                   session_id       = ?,
+                   tokens_in        = ?,
+                   tokens_out       = ?,
+                   tool_calls       = ?,
+                   ended_at         = ?,
+                   raw_summary_json = ?
+             WHERE issue_id = ? AND attempt_id = ?
+            """,
+            [
+              Map.get(info, :session_id),
+              Map.get(summary, :tokens_in),
+              Map.get(summary, :tokens_out),
+              Map.get(summary, :tool_calls),
+              now,
+              Jason.encode!(summary),
+              issue_id,
+              attempt_id
+            ]
+          )
 
-        :ok = insert_event_in_tx(conn, %{
-          ts: now,
-          boot_run_id: boot_run_id,
-          fence_seq: fence_seq,
-          issue_id: issue_id,
-          turn_id: Map.get(info, :turn_id),
-          chain: Map.get(info, :chain),
-          kind: "completed",
-          payload: %{summary: summary}
-        })
+        :ok =
+          insert_event_in_tx(conn, %{
+            ts: now,
+            boot_run_id: boot_run_id,
+            fence_seq: fence_seq,
+            issue_id: issue_id,
+            turn_id: Map.get(info, :turn_id),
+            chain: Map.get(info, :chain),
+            kind: "completed",
+            payload: %{summary: summary, verifier: Map.get(info, :verification)}
+          })
 
         :ok
       end)
@@ -202,8 +337,9 @@ defmodule SymphonyElixir.State.Issues do
         {:ok, fence_seq} = State.allocate_fence(conn)
         attempt_id = Map.fetch!(info, :attempt_id)
         reason = Map.fetch!(info, :reason)
+        expected_state = Map.get(info, :expected_state, "turn_running")
 
-        assert_state!(conn, issue_id, "turn_running", attempt_id)
+        assert_state!(conn, issue_id, expected_state, attempt_id)
 
         existing = fetch_issue(conn, issue_id)
         prev_used = existing.retry_budget_used || 0
@@ -220,55 +356,72 @@ defmodule SymphonyElixir.State.Issues do
             :exhausted -> {"quarantined", nil}
           end
 
-        :ok = exec!(conn, """
-        UPDATE issues
-           SET state               = ?,
-               retry_budget_used   = ?,
-               retry_next_at       = ?,
-               last_failure_reason = ?,
-               owner_boot_run_id   = NULL,
-               claim_expires_at    = NULL,
-               fence_seq           = ?,
-               current_turn_id     = NULL,
-               last_event_at       = ?,
-               last_event_kind     = ?
-         WHERE issue_id = ?
-        """, [
-          next_state,
-          new_used,
-          retry_next_at,
-          Atom.to_string(reason),
-          fence_seq,
-          now,
-          next_state,
-          issue_id
-        ])
+        :ok =
+          exec!(
+            conn,
+            """
+            UPDATE issues
+               SET state               = ?,
+                   retry_budget_used   = ?,
+                   retry_next_at       = ?,
+                   last_failure_reason = ?,
+                   owner_boot_run_id   = NULL,
+                   claim_expires_at    = NULL,
+                   fence_seq           = ?,
+                   current_turn_id     = NULL,
+                   last_event_at       = ?,
+                   last_event_kind     = ?
+             WHERE issue_id = ?
+            """,
+            [
+              next_state,
+              new_used,
+              retry_next_at,
+              Atom.to_string(reason),
+              fence_seq,
+              now,
+              next_state,
+              issue_id
+            ]
+          )
 
-        :ok = exec!(conn, """
-        UPDATE turn_attempts
-           SET state       = 'failed',
-               reason      = ?,
-               error_class = ?,
-               ended_at    = ?
-         WHERE issue_id = ? AND attempt_id = ?
-        """, [
-          Atom.to_string(reason),
-          Atom.to_string(reason),
-          now,
-          issue_id,
-          attempt_id
-        ])
+        :ok =
+          exec!(
+            conn,
+            """
+            UPDATE turn_attempts
+               SET state       = 'failed',
+                   reason      = ?,
+                   error_class = ?,
+                   ended_at    = ?
+             WHERE issue_id = ? AND attempt_id = ?
+            """,
+            [
+              Atom.to_string(reason),
+              Atom.to_string(reason),
+              now,
+              issue_id,
+              attempt_id
+            ]
+          )
 
-        :ok = insert_event_in_tx(conn, %{
-          ts: now,
-          boot_run_id: boot_run_id,
-          fence_seq: fence_seq,
-          issue_id: issue_id,
-          turn_id: Map.get(info, :turn_id),
-          chain: Map.get(info, :chain),
-          kind: next_state,
-          payload: %{reason: reason, retry_budget_used: new_used, retry_next_at: retry_next_at}
-        })
+        :ok =
+          insert_event_in_tx(conn, %{
+            ts: now,
+            boot_run_id: boot_run_id,
+            fence_seq: fence_seq,
+            issue_id: issue_id,
+            turn_id: Map.get(info, :turn_id),
+            chain: Map.get(info, :chain),
+            kind: next_state,
+            payload: %{
+              reason: reason,
+              classification: Map.get(info, :classification),
+              verification: Map.get(info, :verification),
+              retry_budget_used: new_used,
+              retry_next_at: retry_next_at
+            }
+          })
 
         %{state: next_state, retry_budget_used: new_used, retry_next_at: retry_next_at}
       end)
@@ -342,51 +495,90 @@ defmodule SymphonyElixir.State.Issues do
 
   defp upsert_issue!(conn, m) do
     if m.existing do
-      :ok = exec!(conn, """
-      UPDATE issues
-         SET chain             = ?,
-             agent             = ?,
-             state             = ?,
-             attempt_id        = ?,
-             owner_boot_run_id = ?,
-             owner_lane        = ?,
-             claim_expires_at  = ?,
-             fence_seq         = ?,
-             current_turn_id   = ?,
-             last_event_at     = ?,
-             last_event_kind   = ?
-       WHERE issue_id = ?
-      """, [
-        m.chain, m.agent, m.state, m.attempt_id,
-        m.owner_boot_run_id, m.owner_lane, m.claim_expires_at,
-        m.fence_seq, m.current_turn_id, m.last_event_at, m.last_event_kind,
-        m.issue_id
-      ])
+      :ok =
+        exec!(
+          conn,
+          """
+          UPDATE issues
+             SET chain             = ?,
+                 agent             = ?,
+                 state             = ?,
+                 attempt_id        = ?,
+                 owner_boot_run_id = ?,
+                 owner_lane        = ?,
+                 claim_expires_at  = ?,
+                 fence_seq         = ?,
+                 current_turn_id   = ?,
+                 last_event_at     = ?,
+                 last_event_kind   = ?
+           WHERE issue_id = ?
+          """,
+          [
+            m.chain,
+            m.agent,
+            m.state,
+            m.attempt_id,
+            m.owner_boot_run_id,
+            m.owner_lane,
+            m.claim_expires_at,
+            m.fence_seq,
+            m.current_turn_id,
+            m.last_event_at,
+            m.last_event_kind,
+            m.issue_id
+          ]
+        )
     else
-      :ok = exec!(conn, """
-      INSERT INTO issues(
-        issue_id, chain, agent, state, attempt_id,
-        owner_boot_run_id, owner_lane, claim_expires_at,
-        fence_seq, current_turn_id, started_at, last_event_at, last_event_kind
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      """, [
-        m.issue_id, m.chain, m.agent, m.state, m.attempt_id,
-        m.owner_boot_run_id, m.owner_lane, m.claim_expires_at,
-        m.fence_seq, m.current_turn_id, m.now, m.last_event_at, m.last_event_kind
-      ])
+      :ok =
+        exec!(
+          conn,
+          """
+          INSERT INTO issues(
+            issue_id, chain, agent, state, attempt_id,
+            owner_boot_run_id, owner_lane, claim_expires_at,
+            fence_seq, current_turn_id, started_at, last_event_at, last_event_kind
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          """,
+          [
+            m.issue_id,
+            m.chain,
+            m.agent,
+            m.state,
+            m.attempt_id,
+            m.owner_boot_run_id,
+            m.owner_lane,
+            m.claim_expires_at,
+            m.fence_seq,
+            m.current_turn_id,
+            m.now,
+            m.last_event_at,
+            m.last_event_kind
+          ]
+        )
     end
   end
 
   defp insert_turn_attempt!(conn, m) do
-    :ok = exec!(conn, """
-    INSERT INTO turn_attempts(
-      issue_id, attempt_id, turn_id, lane, state,
-      fence_seq, boot_run_id, started_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-      m.issue_id, m.attempt_id, m.turn_id, m.lane, m.state,
-      m.fence_seq, m.boot_run_id, m.started_at
-    ])
+    :ok =
+      exec!(
+        conn,
+        """
+        INSERT INTO turn_attempts(
+          issue_id, attempt_id, turn_id, lane, state,
+          fence_seq, boot_run_id, started_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+          m.issue_id,
+          m.attempt_id,
+          m.turn_id,
+          m.lane,
+          m.state,
+          m.fence_seq,
+          m.boot_run_id,
+          m.started_at
+        ]
+      )
   end
 
   defp assert_state!(conn, issue_id, expected_state, expected_attempt) do
@@ -401,13 +593,16 @@ defmodule SymphonyElixir.State.Issues do
     :ok = Sqlite3.release(conn, stmt)
 
     case result do
-      {:row, [^expected_state, ^expected_attempt]} -> :ok
+      {:row, [^expected_state, ^expected_attempt]} ->
+        :ok
+
       {:row, [actual_state, actual_attempt]} ->
         raise %SymphonyElixir.State.Issues.StaleStateError{
           issue_id: issue_id,
           expected: {expected_state, expected_attempt},
           actual: {actual_state, actual_attempt}
         }
+
       :done ->
         raise %SymphonyElixir.State.Issues.StaleStateError{
           issue_id: issue_id,
@@ -457,11 +652,25 @@ defmodule SymphonyElixir.State.Issues do
   end
 
   defp row_to_map([
-         issue_id, chain, agent, session_id, state, attempt_id,
-         retry_budget_used, retry_next_at, last_failure_reason,
-         owner_boot_run_id, owner_lane, claim_expires_at, fence_seq,
-         current_turn_id, started_at, last_event_at, last_event_kind,
-         linear_state, payload_json
+         issue_id,
+         chain,
+         agent,
+         session_id,
+         state,
+         attempt_id,
+         retry_budget_used,
+         retry_next_at,
+         last_failure_reason,
+         owner_boot_run_id,
+         owner_lane,
+         claim_expires_at,
+         fence_seq,
+         current_turn_id,
+         started_at,
+         last_event_at,
+         last_event_kind,
+         linear_state,
+         payload_json
        ]) do
     %{
       issue_id: issue_id,
@@ -496,26 +705,42 @@ defmodule SymphonyElixir.State.Issues do
 
   defp insert_event_in_tx(conn, ev) do
     payload = Jason.encode!(Map.get(ev, :payload, %{}))
-    exec!(conn, """
-    INSERT INTO events(ts, boot_run_id, fence_seq, issue_id, turn_id, chain, kind, payload_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-      ev.ts, ev.boot_run_id, ev.fence_seq,
-      Map.get(ev, :issue_id), Map.get(ev, :turn_id), Map.get(ev, :chain),
-      ev.kind, payload
-    ])
+
+    exec!(
+      conn,
+      """
+      INSERT INTO events(ts, boot_run_id, fence_seq, issue_id, turn_id, chain, kind, payload_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      """,
+      [
+        ev.ts,
+        ev.boot_run_id,
+        ev.fence_seq,
+        Map.get(ev, :issue_id),
+        Map.get(ev, :turn_id),
+        Map.get(ev, :chain),
+        ev.kind,
+        payload
+      ]
+    )
 
     State.append_event_wal(%{
-      ts: ev.ts, boot_run_id: ev.boot_run_id, fence_seq: ev.fence_seq,
-      issue_id: Map.get(ev, :issue_id), turn_id: Map.get(ev, :turn_id),
-      chain: Map.get(ev, :chain), kind: ev.kind,
+      ts: ev.ts,
+      boot_run_id: ev.boot_run_id,
+      fence_seq: ev.fence_seq,
+      issue_id: Map.get(ev, :issue_id),
+      turn_id: Map.get(ev, :turn_id),
+      chain: Map.get(ev, :chain),
+      kind: ev.kind,
       payload: Map.get(ev, :payload, %{})
     })
   end
 
   defp normalize_tx_result({:ok, :ok}), do: :ok
   defp normalize_tx_result({:ok, value}), do: {:ok, value}
+
   defp normalize_tx_result({:error, {%SymphonyElixir.State.Issues.StaleStateError{} = e, _}}),
     do: {:error, {:stale_state, e}}
+
   defp normalize_tx_result({:error, reason}), do: {:error, reason}
 end

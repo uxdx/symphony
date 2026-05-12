@@ -20,6 +20,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   alias SymphonyElixir.Cmux
   alias SymphonyElixir.Codex.ExecJsonParser
   alias SymphonyElixir.Linear.Mutate
+  alias SymphonyElixir.Verification
   alias SymphonyElixir.State.{AuthRealms, Issues}
 
   require Logger
@@ -56,7 +57,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         {cmd_body, prompt_path} = build_codex_exec_cmd(session, prompt)
 
         try do
-          do_run_turn(session, issue_key, turn_id, attempt_id, cmd_body,
+          do_run_turn(session, issue, issue_key, turn_id, attempt_id, cmd_body,
             chain: chain,
             workspace: workspace,
             timeout: timeout,
@@ -99,21 +100,26 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
       case session.session_id do
         sid when is_binary(sid) and sid != "" ->
           [
-            "codex", "exec", "resume", shell_quote(sid),
+            "codex",
+            "exec",
+            "resume",
+            shell_quote(sid),
             "--dangerously-bypass-approvals-and-sandbox"
           ]
 
         _ ->
           [
-            "codex", "exec",
-            "-C", shell_quote(session.workspace),
+            "codex",
+            "exec",
+            "-C",
+            shell_quote(session.workspace),
             "--dangerously-bypass-approvals-and-sandbox"
           ]
       end
 
     body = """
     #!/usr/bin/env bash
-    export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+    export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
     exec #{Enum.join(args, " ")} < #{shell_quote(prompt_path)}
     """
 
@@ -144,7 +150,7 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
     end
   end
 
-  defp do_run_turn(session, issue_key, turn_id, attempt_id, cmd_body, ctx) do
+  defp do_run_turn(session, issue, issue_key, turn_id, attempt_id, cmd_body, ctx) do
     chain = Keyword.fetch!(ctx, :chain)
     workspace = Keyword.fetch!(ctx, :workspace)
     timeout = Keyword.fetch!(ctx, :timeout)
@@ -167,28 +173,26 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
         summary = events |> ExecJsonParser.summarize() |> Map.put(:success, true)
         new_sid = summary[:session_id] || session.session_id
 
-        if state_required? and not is_nil(issue_key) do
-          :ok =
-            Issues.complete_turn(issue_key, %{
-              attempt_id: attempt_id,
-              turn_id: turn_id,
-              chain: chain,
-              session_id: new_sid,
-              summary: summary
-            })
+        completion =
+          if state_required? and not is_nil(issue_key) do
+            complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts)
+          else
+            :ok
+          end
 
-          :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        case completion do
+          :ok ->
+            new_session = %{session | session_id: new_sid}
+            {:ok, Map.put(summary, :session_id, new_sid), new_session}
+
+          {:error, result} ->
+            {:error, {:verification_failed, result}}
         end
-
-        new_session = %{session | session_id: new_sid}
-        {:ok, Map.put(summary, :session_id, new_sid), new_session}
 
       {:error, reason} ->
         classified = classify_error(reason)
 
-        Logger.warning(
-          "[codex_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}"
-        )
+        Logger.warning("[codex_cmux] run_turn error reason=#{inspect(reason)} classified=#{classified} chain=#{chain}")
 
         if state_required? and not is_nil(issue_key) do
           handle_turn_failure(issue_key, turn_id, attempt_id, chain, classified)
@@ -204,6 +208,61 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
   defp classify_error({:turn_failed, _code, out}) when is_binary(out), do: classify_stdout(out)
   defp classify_error(_), do: :unknown
 
+  defp complete_after_verification(issue_key, issue, workspace, turn_id, attempt_id, chain, new_sid, summary, opts) do
+    :ok =
+      Issues.begin_verification(issue_key, %{
+        attempt_id: attempt_id,
+        turn_id: turn_id,
+        chain: chain,
+        session_id: new_sid,
+        summary: summary
+      })
+
+    case Verification.verify_turn(chain, issue, workspace, summary, opts) do
+      {:ok, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        :ok =
+          Issues.complete_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            session_id: new_sid,
+            summary: summary,
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        :ok = Mutate.post_turn_comment(issue_key, chain, Map.put(summary, :session_id, new_sid))
+        :ok
+
+      {:error, result} ->
+        :ok = record_verification_result(issue_key, turn_id, attempt_id, chain, result)
+
+        {:ok, _} =
+          Issues.fail_turn(issue_key, %{
+            attempt_id: attempt_id,
+            turn_id: turn_id,
+            chain: chain,
+            reason: Verification.retry_reason(result),
+            classification: Map.get(result, :classification),
+            verification: result,
+            expected_state: "verifying"
+          })
+
+        {:error, result}
+    end
+  end
+
+  defp record_verification_result(issue_key, turn_id, attempt_id, chain, result) do
+    Issues.record_verification_result(issue_key, %{
+      attempt_id: attempt_id,
+      turn_id: turn_id,
+      chain: chain,
+      result: result
+    })
+  end
+
   defp classify_stdout(out) do
     # Scan only the last 50 lines to avoid false positives from prompt content
     # or bash terminal echoes that may contain user issue text.
@@ -215,14 +274,14 @@ defmodule SymphonyElixir.Codex.CmuxExecBackend do
 
     cond do
       String.contains?(tail, "TokenRefreshFailed") or
-          String.contains?(tail, "invalid_grant") or
-          String.contains?(tail, "auth_required") or
+        String.contains?(tail, "invalid_grant") or
+        String.contains?(tail, "auth_required") or
           String.contains?(tail, "Not logged in") ->
         :auth_revoked
 
       String.contains?(tail, "Rate limit exceeded") or
-          String.contains?(tail, "Too Many Requests") or
-          String.contains?(tail, "rate_limit_exceeded") or
+        String.contains?(tail, "Too Many Requests") or
+        String.contains?(tail, "rate_limit_exceeded") or
           String.contains?(tail, "HTTP 429") ->
         :rate_limit
 
