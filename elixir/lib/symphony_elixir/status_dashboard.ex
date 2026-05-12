@@ -394,11 +394,15 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_project_link_lines do
     project_part =
-      case Config.settings!().tracker.project_slug do
-        project_slug when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
+      tracker = Config.settings!().tracker
+      cond do
+        is_binary(tracker.project_slug) and tracker.project_slug != "" ->
+          colorize(linear_project_url(tracker.project_slug), @ansi_cyan)
 
-        _ ->
+        is_binary(tracker.team_key) and tracker.team_key != "" ->
+          colorize("https://linear.app/sazo/team/#{tracker.team_key}/issues", @ansi_cyan)
+
+        true ->
           colorize("n/a", @ansi_gray)
       end
 

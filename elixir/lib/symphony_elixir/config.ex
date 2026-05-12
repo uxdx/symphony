@@ -3,6 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
+  alias SymphonyElixir.Config.Compiler
   alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Workflow
 
@@ -98,6 +99,9 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec preflight_file(Path.t()) :: :ok | {:error, String.t()}
+  def preflight_file(path), do: Compiler.preflight_file(path)
+
   @spec codex_runtime_settings(Path.t() | nil, keyword()) ::
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
@@ -111,25 +115,6 @@ defmodule SymphonyElixir.Config do
            turn_sandbox_policy: turn_sandbox_policy
          }}
       end
-    end
-  end
-
-  defp validate_semantics(settings) do
-    cond do
-      is_nil(settings.tracker.kind) ->
-        {:error, :missing_tracker_kind}
-
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
-        {:error, :missing_linear_project_slug}
-
-      true ->
-        :ok
     end
   end
 
@@ -150,5 +135,29 @@ defmodule SymphonyElixir.Config do
       other ->
         "Invalid WORKFLOW.md config: #{inspect(other)}"
     end
+  end
+
+  defp validate_semantics(settings) do
+    cond do
+      is_nil(settings.tracker.kind) ->
+        {:error, :missing_tracker_kind}
+
+      settings.tracker.kind not in ["linear", "memory"] ->
+        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
+
+      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
+        {:error, :missing_linear_api_token}
+
+      settings.tracker.kind == "linear" and locator_count(settings.tracker) != 1 ->
+        {:error, :missing_linear_project_slug_or_team_key}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp locator_count(tracker) do
+    [tracker.project_slug, tracker.team_key]
+    |> Enum.count(&is_binary/1)
   end
 end
