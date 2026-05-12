@@ -60,9 +60,22 @@ defmodule SymphonyElixir.MixProject do
       symphony: [
         applications: [symphony_elixir: :permanent],
         include_executables_for: [:unix],
-        steps: [:assemble]
+        steps: [:assemble, &write_release_commit/1]
       ]
     ]
+  end
+
+  defp write_release_commit(%Mix.Release{} = release) do
+    commit = System.get_env("SYMPHONY_RELEASE_COMMIT") || git_head() || "unknown"
+    File.write!(Path.join(release.path, "RELEASE_COMMIT"), commit <> "\n")
+    release
+  end
+
+  defp git_head do
+    case System.cmd("git", ["rev-parse", "HEAD"], stderr_to_stdout: true) do
+      {commit, 0} -> String.trim(commit)
+      _ -> nil
+    end
   end
 
   # Run "mix help compile.app" to learn about applications.
