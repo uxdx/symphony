@@ -15,10 +15,13 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
-            retrying: length(snapshot.retrying)
+            retrying: length(snapshot.retrying),
+            db_turn_running_not_runtime: length(db_turn_running_not_runtime(snapshot)),
+            orphaned_turn_attempts: length(orphaned_turn_attempts(snapshot))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          db: db_payload(snapshot),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -128,6 +131,52 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
+  defp db_payload(snapshot) do
+    %{
+      turn_running_not_runtime:
+        snapshot
+        |> db_turn_running_not_runtime()
+        |> Enum.map(&db_turn_running_payload/1),
+      orphaned_turn_attempts:
+        snapshot
+        |> orphaned_turn_attempts()
+        |> Enum.map(&orphaned_turn_attempt_payload/1),
+      error: get_in(snapshot, [:db, :error])
+    }
+  end
+
+  defp db_turn_running_not_runtime(snapshot), do: get_in(snapshot, [:db, :turn_running_not_runtime]) || []
+  defp orphaned_turn_attempts(snapshot), do: get_in(snapshot, [:db, :orphaned_turn_attempts]) || []
+
+  defp db_turn_running_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.issue_id,
+      chain: entry.chain,
+      state: entry.state,
+      attempt_id: entry.attempt_id,
+      owner_boot_run_id: entry.owner_boot_run_id,
+      owner_pid: entry.owner_pid,
+      owner_status: Map.get(entry, :owner_status),
+      last_event_at: unix_iso8601(entry.last_event_at),
+      last_event_kind: entry.last_event_kind
+    }
+  end
+
+  defp orphaned_turn_attempt_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      attempt_id: entry.attempt_id,
+      turn_id: entry.turn_id,
+      lane: entry.lane,
+      state: entry.state,
+      issue_state: entry.issue_state,
+      orphan_reason: entry.orphan_reason,
+      started_at: unix_iso8601(entry.started_at),
+      ended_at: unix_iso8601(entry.ended_at)
+    }
+  end
+
   defp running_issue_payload(running) do
     %{
       worker_host: Map.get(running, :worker_host),
@@ -197,4 +246,13 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+
+  defp unix_iso8601(value) when is_integer(value) do
+    value
+    |> DateTime.from_unix!()
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp unix_iso8601(_value), do: nil
 end

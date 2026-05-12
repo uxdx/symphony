@@ -92,6 +92,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">DB stale</p>
+            <p class="metric-value numeric"><%= @payload.counts.db_turn_running_not_runtime %></p>
+            <p class="metric-detail">Durable turn_running rows absent from runtime running.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -104,6 +110,84 @@ defmodule SymphonyElixirWeb.DashboardLive do
             <p class="metric-value numeric"><%= format_runtime_seconds(total_runtime_seconds(@payload, @now)) %></p>
             <p class="metric-detail">Total Codex runtime across completed and active sessions.</p>
           </article>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">State DB reconciliation</h2>
+              <p class="section-copy">Durable state rows that disagree with the current runtime snapshot.</p>
+            </div>
+          </div>
+
+          <%= if @payload.db.error do %>
+            <p class="empty-state danger-text"><%= @payload.db.error %></p>
+          <% end %>
+
+          <%= if @payload.db.turn_running_not_runtime == [] and @payload.db.orphaned_turn_attempts == [] do %>
+            <p class="empty-state">No stale turn_running rows or orphaned turn attempts detected.</p>
+          <% else %>
+            <%= if @payload.db.turn_running_not_runtime != [] do %>
+              <div class="table-wrap">
+                <table class="data-table" style="min-width: 860px;">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>State</th>
+                      <th>Attempt</th>
+                      <th>Owner boot</th>
+                      <th>Owner PID</th>
+                      <th>Owner status</th>
+                      <th>Last event</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @payload.db.turn_running_not_runtime}>
+                      <td><span class="issue-id"><%= entry.issue_identifier %></span></td>
+                      <td><span class="state-badge state-badge-danger"><%= entry.state %></span></td>
+                      <td class="numeric"><%= entry.attempt_id %></td>
+                      <td class="numeric"><%= entry.owner_boot_run_id || "n/a" %></td>
+                      <td class="numeric"><%= entry.owner_pid || "n/a" %></td>
+                      <td><%= entry.owner_status || "unknown" %></td>
+                      <td>
+                        <div class="detail-stack">
+                          <span><%= entry.last_event_kind || "n/a" %></span>
+                          <span class="muted mono numeric"><%= entry.last_event_at || "n/a" %></span>
+                        </div>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+
+            <%= if @payload.db.orphaned_turn_attempts != [] do %>
+              <div class="table-wrap">
+                <table class="data-table" style="min-width: 760px;">
+                  <thead>
+                    <tr>
+                      <th>Issue</th>
+                      <th>Attempt</th>
+                      <th>Turn</th>
+                      <th>Attempt state</th>
+                      <th>Issue state</th>
+                      <th>Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={entry <- @payload.db.orphaned_turn_attempts}>
+                      <td><span class="issue-id"><%= entry.issue_id %></span></td>
+                      <td class="numeric"><%= entry.attempt_id %></td>
+                      <td class="mono"><%= entry.turn_id %></td>
+                      <td><%= entry.state %></td>
+                      <td><%= entry.issue_state || "missing" %></td>
+                      <td><%= entry.orphan_reason %></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            <% end %>
+          <% end %>
         </section>
 
         <section class="section-card">

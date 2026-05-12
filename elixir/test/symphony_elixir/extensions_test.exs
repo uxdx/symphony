@@ -342,7 +342,12 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{
+               "running" => 1,
+               "retrying" => 1,
+               "db_turn_running_not_runtime" => 0,
+               "orphaned_turn_attempts" => 0
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -370,6 +375,11 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "workspace_path" => nil
                }
              ],
+             "db" => %{
+               "turn_running_not_runtime" => [],
+               "orphaned_turn_attempts" => [],
+               "error" => nil
+             },
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -544,6 +554,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
     assert html =~ "Runtime"
+    assert html =~ "State DB reconciliation"
     assert html =~ "Live"
     assert html =~ "Offline"
     assert html =~ "Copy ID"
@@ -641,7 +652,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "db_turn_running_not_runtime" => 0,
+             "orphaned_turn_attempts" => 0
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200

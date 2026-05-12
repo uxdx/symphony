@@ -21,6 +21,7 @@ defmodule SymphonyElixir.State do
   use GenServer
 
   alias Exqlite.Sqlite3
+  alias SymphonyElixir.State.Issues
   alias SymphonyElixir.State.Migrations
 
   require Logger
@@ -142,10 +143,9 @@ defmodule SymphonyElixir.State do
 
     boot = insert_boot_run!(conn)
     :persistent_term.put({__MODULE__, :boot_run_id}, boot.boot_run_id)
+    {:ok, stale_reconcile} = Issues.reconcile_stale_turn_running_on_boot(conn, boot_run_id: boot.boot_run_id)
 
-    Logger.info(
-      "[symphony-state] db=#{db_path} boot_run_id=#{boot.boot_run_id} pid=#{boot.pid}"
-    )
+    Logger.info("[symphony-state] db=#{db_path} boot_run_id=#{boot.boot_run_id} pid=#{boot.pid} stale_turn_running_reconciled=#{length(stale_reconcile.reconciled)}")
 
     {:ok, %{conn: conn, db_path: db_path, boot: boot}}
   end
@@ -178,10 +178,12 @@ defmodule SymphonyElixir.State do
 
   defp insert_boot_run!(conn) do
     pid_int = String.to_integer(System.pid())
-    hostname = case :inet.gethostname() do
-      {:ok, h} -> List.to_string(h)
-      _ -> "unknown"
-    end
+
+    hostname =
+      case :inet.gethostname() do
+        {:ok, h} -> List.to_string(h)
+        _ -> "unknown"
+      end
 
     started_at = System.system_time(:second)
 
@@ -229,9 +231,14 @@ defmodule SymphonyElixir.State do
     :ok = Sqlite3.release(conn, stmt)
 
     append_event_wal(%{
-      ts: ts, boot_run_id: boot_run_id, fence_seq: fence_seq,
-      issue_id: issue_id, turn_id: turn_id, chain: chain,
-      kind: kind, payload: Map.get(ev, :payload, %{})
+      ts: ts,
+      boot_run_id: boot_run_id,
+      fence_seq: fence_seq,
+      issue_id: issue_id,
+      turn_id: turn_id,
+      chain: chain,
+      kind: kind,
+      payload: Map.get(ev, :payload, %{})
     })
 
     :ok

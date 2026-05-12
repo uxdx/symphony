@@ -5,6 +5,7 @@
 │ Runtime: 0m 0s
 │ Tokens: in 0 | out 0 | total 0
 │ Rate Limits: unavailable
+│ State DB: clean
 │ Project: https://linear.app/project/project/issues
 │ Next refresh: n/a
 ├─ Running
@@ -12,6 +13,10 @@
 │   ID       STAGE          PID      AGE / TURN   TOKENS     SESSION        EVENT                                  
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │  No active agents
+│
+├─ State DB reconciliation
+│
+│  No stale DB running rows or orphaned turn attempts
 │
 ├─ Backoff queue
 │
